@@ -53,6 +53,20 @@ _COSMOS_CLASS = "ModelSamplingCosmosRFlow"
 # as current truth).
 # ---------------------------------------------------------------------------
 def _sigma_of_flow_time(ms, tau):
+    """sigma at flow time tau (1 = pure noise, 0 = clean) from the model's own map.
+
+    THE TIMESTEP SCALE IS NOT FLOW TIME ON EVERY CLASS.  `ModelSamplingDiscreteFlow`
+    (SD3/3.5, Wan, LTXV, and `ModelSamplingAV`, which inherits it) defines
+    `sigma(timestep) = time_snr_shift(shift, timestep / multiplier)` with
+    `multiplier = 1000` (`comfy/model_sampling.py:328-329`), i.e. it wants a NATIVE
+    TIMESTEP in [0, multiplier], not tau in [0, 1].  Passing tau there returned
+    `time_snr_shift(shift, tau/1000)` and the emitted top sigma came out 334x too
+    small on SD3, 126x on Wan and 423x on LTXV (measured; "1000x" is the
+    argument-domain error, not the emitted ratio).  Those classes are the ones that
+    carry `multiplier`, so the map is `sigma(tau * multiplier)` and it is exact at
+    any shift.  Every other class takes flow time (Flux) or its own fraction
+    (Cosmos, handled above) directly.
+    """
     cls = type(ms).__name__
     tau = float(tau)
     if cls == _COSMOS_CLASS:
@@ -60,17 +74,20 @@ def _sigma_of_flow_time(ms, tau):
         if tau >= smax / (smax + 1.0):
             return smax
         return tau / (1.0 - tau)
-    try:  # Flux and generic: model's own forward map
+    mult = getattr(ms, "multiplier", None)
+    try:  # the model's own forward map, in the time base that map expects
+        if mult is not None:
+            return float(ms.sigma(torch.tensor(tau * float(mult))))
         return float(ms.sigma(torch.tensor(tau)))
     except Exception:
-        return tau / (1.0 - tau)
+        return tau / max(1.0 - tau, 1e-6)
 
 
 def _uniform_flow_time_sigmas(ms, steps):
     """The paper's OWN grid (Algorithm 2): t = n/N (noise -> clean), uniform
-    flow time over [0, 1]; sigma = sigma(tau = 1 - t).  The scheduler node
-    emits this; the sampler builds the same uniform flow-time grid internally
-    from the step count + [sigma_0, sigma_last] endpoints."""
+    flow time over [0, 1]; sigma = sigma(tau = 1 - t).  The scheduler node emits
+    this and that is its only producer -- the sampler does NOT rebuild it, it
+    consumes whatever sigma list it is handed."""
     out = []
     for n in range(steps + 1):
         t = n / steps

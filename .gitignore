@@ -1,26 +1,6 @@
+# THE SAMPLER's own ignores -- this file ships with the package.
+# The journal's ignores live one level up, in the repo that develops this one.
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-
-# reference material (papers etc.) -- kept locally, not part of the project
-*.pdf
-
-.gitkeys/
-.ssh-known-hosts
-
-# antique snapshots unpacked for study only
-_antique/
-comfyui-research-samplers.7z
-
-# streaming output of long-running scratch rigs (re-run them, don't commit them)
-_rig_*.log
-
-# CALIBRATION INPUTS -- kept on disk, deliberately NOT in history.
-# The temp PNGs from ComfyUI and the saved latents are read to CALIBRATE and to check a rig, and
-# they are copied here so a ComfyUI restart cannot delete them -- but they are inputs, not results,
-# and they are megabytes of pixels with no reason to sit in the history.  The rig OUTPUT (the
-# numbers) is what gets committed.  Recorded as a rule because it is easy to forget the next time
-# an image looks like evidence: the evidence is the table, not the file.
-latent_images/
-*.latent

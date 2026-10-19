@@ -1,0 +1,39 @@
+# Lint configuration for the SAMPLER package.
+#
+# WHY THIS FILE EXISTS. `rig_lint.py` -- which lives one level up, in the journal --
+# runs this config after every code edit. It is the mechanical floor under "write
+# good Python here": it costs zero tokens of agent context, and unlike a sentence in
+# a document it cannot be forgotten, misread, or drift out of agreement with the code.
+#
+# NOT A BUILD OR DEPENDENCY MANIFEST. This is deliberately `ruff.toml` and not
+# `pyproject.toml`: nothing here describes the package, declares a build backend, or
+# pins a runtime dependency. The package has no install step -- ComfyUI imports it
+# straight out of the directory its custom_nodes junction points at.
+
+target-version = "py313"   # matches the interpreter the engine actually runs under
+
+[lint]
+# THE SAME SET COMFYUI ITSELF RUNS (its `pyproject.toml` selects this family and
+# ignores the six codes below). Adopting the neighbouring house style rather than
+# inventing one means a change that passes here also passes there.
+#
+# Stated explicitly instead of left to ruff's defaults: a future ruff release
+# changing its default set must not silently change what this repo enforces.
+select = [
+    "E4",   # imports: multiple statements on one line, wildcard imports
+    "E7",   # statement style: semicolons, lambda assignment, == on a literal
+    "E9",   # runtime: syntax errors, IOError, `assert False`
+    "F",    # pyflakes: UNDEFINED NAMES, unused imports/variables, repeated dict keys
+]
+
+# Forked from ComfyUI's ignore list, and each is a real decision, not an accident:
+#   E501 line-too-long       -- this codebase tolerates long lines on purpose
+#   E722 bare-except         -- the module must import without `comfy.samplers`; that
+#                               guard IS the fallback, so bare excepts are load-bearing
+#   E731 lambda-assignment   -- 1 occurrence, kept for local style
+#   E712 == on a literal     -- numpy/pandas patterns; not a bug here
+#   E402 import-not-at-top   -- MEASURED: fires 0 times in this package, so ignoring
+#                               it costs nothing and keeps the option of a deliberate
+#                               late import available
+#   E741 ambiguous-name      -- 2 occurrences of `l`, left as the author wrote them
+ignore = ["E501", "E722", "E731", "E712", "E402", "E741"]
