@@ -64,18 +64,16 @@ def _sig_tensor_list(v):
 
 
 class ResearchAFlopsSampler:
-    DESCRIPTION = ("PD-AOS (Adaptive Flow Path Sampler). Implements the core method "
-                   "from Jin et al. (AAAI 2026, arXiv:2509.00036): the velocity field "
-                   "is decomposed into a linear drift and a slowly-varying residual via "
-                   "an adaptive coefficient, then integrated with an exponential "
-                   "integrator. Pure single-solver engine: every step runs the "
-                   "PD-AOS formula with ZERO extra model calls, and the per-pixel "
-                   "adaptive order ladder feeds the residual integrator. Without extra "
-                   "inputs it runs fully automatic: noise colour, anomaly "
-                   "detection, the local per-region schedule field with its spatial "
-                   "fragility prior, and flow/VE detection are all self-tuned from the probes. "
-                   "Connect a MODEL for auto-detection. "
-                   "Connect Options nodes to override any group of settings.")
+    DESCRIPTION = ("PD-AOS is an adaptive sampler for diffusion models. At each step it "
+                   "splits the model's prediction into a straight-line part and a "
+                   "correction, solves the straight-line part exactly, and extrapolates the "
+                   "correction from earlier steps. That keeps one model call per step while "
+                   "following curved paths, and each pixel can use its own number of "
+                   "earlier steps when that helps. Most behaviour adapts automatically. "
+                   "Connect a MODEL so PD-AOS can detect the model type, noise scale, video "
+                   "latents and distilled models. Connect the Autotuner to measure the "
+                   "model and tune the schedule, and connect Options nodes to override "
+                   "individual settings.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
@@ -83,7 +81,7 @@ class ResearchAFlopsSampler:
         return {
             "required": {
                 "log_errors": ("BOOLEAN", {"default": False,
-                    "tooltip": "Writes what the sampler decides at every step to the console, and fills the PD-AOS Error Report node. Leave it on while you are testing a prompt; off for normal use."}),
+                    "tooltip": "Prints the sampler's decisions at every step to the console. It does not change the image. A run longer than 64 steps keeps the first 64 step records in the Error Report when this is off, and the latest 64 when it is on. Turn it on while testing a prompt; leave it off for normal runs."}),
                 # THE BOUND A/B WAS HERE AND IS GONE (2026-10-04).  `order_bound_fix` was a Sampler
                 # widget for one turn; the A/B ran on three real pairs, and the corrected remainder
                 # scale that it toggled is now the ONLY path in `_pixel_order_bound`.  Operator:
@@ -119,8 +117,8 @@ class ResearchAFlopsSampler:
                 # node that sets the keys, is honoured rather than silently ignored.
             },
             "optional": {
-                "model": ("MODEL", {"tooltip": "Connect the MODEL for auto-tuning. PD-AOS will detect the model type (flow vs VE), read sigma_data for correct SNR math, detect video latents, and detect distilled models (turbo/schnell/lightning). All auto-tuning can be overridden by Options nodes. Without this, PD-AOS uses a sigma-magnitude heuristic."}),
-                "options+": (OPT_TYPE, {"tooltip": "Connect any number of PD-AOS Options nodes here. Each connected group overrides the automatic settings for its fields."}),
+                "model": ("MODEL", {"tooltip": "Connect the MODEL so PD-AOS can adapt to it: model type, noise scale, video latents and distilled models (turbo, schnell, lightning) are detected automatically. Any Options node can override what is detected. Without a MODEL, the sampler falls back to a simple noise-level estimate."}),
+                "options+": (OPT_TYPE, {"tooltip": "Connect one or more PD-AOS Options nodes here. Their settings override the sampler's automatic choices for the fields they set. Chain them in the order you want applied: the node closest to the sampler wins when two set the same field."}),
                 # APPENDED LAST (rule 35).  ComfyUI stores a saved workflow's widget values as a
                 # POSITIONAL list, so a widget added anywhere but the END re-maps the values of
                 # the widgets after it -- silently, and onto plausible numbers.  Appending here
@@ -128,13 +126,13 @@ class ResearchAFlopsSampler:
                 # this one, which is what makes the change safe to load.
                 "use_measured_tolerance": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("use_measured_tolerance", False)),
-                    "tooltip": "Which number sets the sampler's tolerance for a step's error: the tolerance the Autotuner MEASURED for your model, or that same value with a fixed MINIMUM of 0.01536 applied on top of it. OFF (the default) applies the minimum, so a measured tolerance below 0.01536 is raised to it -- this is what the sampler has always done. ON uses the measured value exactly as measured, however small it is, which makes the sampler accept less error per step and fall back to the plain step more often. If your model's measured tolerance is already above 0.01536 the two settings behave identically. MEASURED over 439 logged runs on 7 models: the minimum was raising the tolerance on 289 of the 302 runs that had a measured value, and on those runs turning it off moves the typical tolerance by between 1.37x and 2.77x depending on the model, so this is a large change rather than a trim. It is a TEST ARM, not an improvement: both numbers are measurements, they disagree, and nothing here can say which one looks better -- so it stays OFF until you have compared the two on your own model and prompt. The value it used is written into every run's log (`tol_in_force`), together with the measured value it replaced (`rtol_measured`)."}),
+                    "tooltip": "Chooses the tolerance used to judge each step's error. Off: take the tolerance measured for your model, but never below a fixed minimum (0.01536). On: take the measured value exactly, however small it is, so the sampler refuses its correction more often and falls back to the plain step. When the measured value is already above the minimum, both settings behave the same. Only does anything when the Autotuner has measured the model; otherwise the sampler's own tolerance is used."}),
                 "probe_fuse_per_step": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("probe_fuse_per_step", False)),
-                    "tooltip": "How the two probes' measurements are combined. OFF (the default) is what the sampler has always done: the model probe and the prompt probe are each boiled down to one number per setting (tolerance, order cap, guard floor, anomaly thresholds) and those two numbers are averaged 50/50, once, before sampling starts. ON keeps them apart as per-step curves instead: both probes' measured curves of how much the image moves at each step are lined up with YOUR step positions, the sampler watches which probe is actually tracking the run as it goes, and each step's ORDER CAP is worked out from the combined curve -- and when the two probes disagree enough to allow different orders, the sampler takes the SAFER, lower order rather than the average. What ON does NOT change: the guard floor, the anomaly thresholds and the step tolerance. Cost: nothing extra is measured, no extra model calls, and the runtime work is arithmetic on numbers already in memory. It is a TEST ARM, not an improvement: nothing here can say which one looks better on your model and prompt, which is why both are available and why the default is the old behaviour. What it used is written into the run log (`probe_fuse` at the top level, and `fuse_w_in_force` per step)."}),
+                    "tooltip": "How the model probe and the prompt probe are combined. Off: each probe is reduced to one number per setting, and the two numbers are averaged once before sampling. On: both probes' per-step curves are kept, lined up with your actual steps, and each step's order limit comes from the combined curve; where the probes disagree, the lower (safer) order is used. It does not change the guard, the anomaly detector or the tolerance. It needs probe measurements, so connect the Autotuner or another Options node that supplies them."}),
                 "probe_fuse_raise_cap": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("probe_fuse_raise_cap", False)),
-                    "tooltip": "Only used when 'probe_fuse_per_step' is ON, and it decides whether the combined curve is allowed to ask for a HIGHER order than the sampler would otherwise use. OFF (the default) means the combined curve can only ever LOWER the order -- the sampler behaves exactly as it does today, just with the two probes combined per step instead of once, so switching the fusion on is a change in ONE thing only and the two settings can be compared fairly. ON lets the combined curve also RAISE the order above the normal cap. Be aware that ON is two changes at once: raising the cap also switches on this sampler's probe-derived order bound in the cases where that bound is normally off, so an image difference under ON cannot be attributed to the probe combination alone. TEST ARM, not a recommendation. Both the setting and the caps it produced are written into the run log."}),
+                    "tooltip": "Only used when 'probe_fuse_per_step' is on. Off: the combined curve may only lower the order limit, so turning the combination on changes one thing only. On: it may also raise the limit above the normal cap, which changes two things at once and makes the result harder to compare."}),
             }
         }
 
@@ -265,15 +263,13 @@ class ResearchAFlopsSampler:
 
 
 class ResearchAFlopsDebugOptions:
-    DESCRIPTION = ("PD-AOS Debug Options: the FINISHED switches, moved off the Sampler. "
-                   "Every one of these reached a decision -- by measurement plus the operator's "
-                   "eye -- so none of them belongs on the node you use every day. Connect this "
-                   "node's `options` output to the PD-AOS Sampler's `options+` input to drive "
-                   "them again: for an A/B on the same prompt and seed, to re-test a verdict on "
-                   "a new model, or to reproduce an old run. With this node disconnected the "
-                   "Sampler uses the engine defaults, which ARE the decided values. "
-                   "The defaults here are READ FROM THE ENGINE, not repeated, so the two cannot "
-                   "drift apart.")
+    DESCRIPTION = ("PD-AOS Debug Options: advanced switches for testing and for reproducing "
+                   "a run. They are not needed for normal sampling, because the Sampler "
+                   "uses the same values as its defaults. Connect this node's 'options' "
+                   "output to the PD-AOS Sampler's 'options+' input, or chain it through "
+                   "another Options node; the node closest to the Sampler wins where two "
+                   "set the same field. The experimental switches at the bottom are off by "
+                   "default and may change or be removed between releases.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
@@ -285,19 +281,19 @@ class ResearchAFlopsDebugOptions:
             "required": {
                 "order_floor": ("INT", {"default": int(ENGINE_DEFAULTS.get("order_floor", 6)),
                     "min": 0, "max": 6, "step": 1,
-                    "tooltip": "0 = AUTOMATIC, AND THE SHIPPED DEFAULT (it won 61 % of head-to-heads against the fixed demand across 26 judged prompts and was never the worst pick): demand the high order only while the run's OWN measured error is high, then let go once it settles -- it reads the step's error over its tolerance, and the threshold it used is stamped in the log. 1 = off, the sampler decides by itself. 2-6 = ASKS for at least that many previous steps per pixel -- a DEMAND the safety path may refuse, NOT a guarantee of that order. Above 1, every pixel is pushed up to at least this value, which makes the sampler follow the direction of the trajectory harder. Two safeguards still apply: an order is refused when the step would come out too large, and a pixel the sampler has just reset stays at 1. DECIDED 6, and measured: the demand is largely REFUSED by the safety path, which is why the order actually used tops out below it -- MEASURED on a 16-prompt batch: demanding 6 produced a mean order of 4.80 (against 2.36 when demanding 1) with a maximum of 5, and about 44% of pixels still below the demand. Read it as 'how hard the order system is asked to push', not as the order that will be used."}),
+                    "tooltip": "How much extrapolation order the sampler demands, i.e. how many previous steps each pixel's update should use. 0 = automatic: ask for more order while the run's own error is high, then release as the error settles. 1 = no demand; the sampler chooses. 2-6 = demand at least that many previous steps for every pixel. The demand is a request, not a guarantee: the safety check can refuse it, and a pixel that was just reset stays at order 1. Higher values push the trajectory harder."}),
                 "order_floor_adaptive_rtol": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_floor_adaptive_rtol", 0.05)),
                     "min": 0.0, "max": 1.0, "step": 0.001,
-                    "tooltip": "ONLY DOES ANYTHING WHEN `order_floor` IS 0 (AUTOMATIC), and it sets that mode's FLIP POINT: the automatic demand asks for the high order while the step's measured error over its tolerance is ABOVE this number, and asks for nothing once the error falls below it. Lower = the gate opens more often, so the run sits nearer order floor 6; higher = rarer, so it sits nearer floor 1. GROUNDED, NOT CHOSEN: on a 16-prompt paired batch (768 step records) that ratio has median 0.013, p75 0.0505, p90 0.294 and max 1.158, and it decays through a run -- so 0.0505 (the shipped default, the p75) demands the high order in roughly the worst quarter of the steps, acting early and releasing. Set 0.013 to open it about half the time, 0.294 for the worst tenth; the top of the range is effectively 'never opens', since the largest ratio ever measured is 1.158. THE SAMPLER'S OWN `rtol` ALSO MOVES THIS FLIP POINT, because the gate compares error OVER tolerance -- both numbers are stamped per step (`ord_floor_rtol`, `ord_floor_prev_ratio`), so the pair is always readable from the log. Measured live: at 0.05 the gate opened on 12-15 of 50 steps and put the result 26-71% of the way from order floor 1 to 6, depending on the prompt."}),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic). The error level that opens the automatic demand: the sampler asks for the high order while a step's error divided by its tolerance is above this number. Lower values open the gate more often, so the run stays nearer a high fixed demand; higher values open it less often, so it stays nearer no demand. Roughly 0.01 to 0.3 is the useful range; near the top the gate almost never opens."}),
                 # APPENDED LAST (rule 35): the bound-derived per-step request.
                 "order_demand_q": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_demand_q", 0.0)),
                     "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "ONLY ACTS WHEN `order_floor` IS 0 (AUTOMATIC). 0.0, the default, is OFF: the automatic request comes from the error gate, exactly as before. Above 0 the request for each step becomes the q-QUANTILE OF THE PER-PIXEL VALIDITY BOUND -- the highest order the engine's own remainder criterion considers valid at each pixel's own smoothness. PROVISIONAL AND MEASURED NOT TO DO WHAT IT CLAIMS: on the harness it produced a BINARY request {1, 6} rather than a graded one, and asked for 6 on steps whose own ceiling was 3-5, because the bound is permissive (median 6) and the engine's demand is a scalar floor that discards the per-pixel structure. 0.5 was intended as the median of the bound; 0.0 (OFF) is the only setting that is verified. 0.5 is the MEDIAN of the bound and is the arm worth trying first; 1.0 is its maximum, which is roughly what the fixed demand of 6 already asks for, so it is the least informative setting. WHY A QUANTILE AND NOT THE ERROR RATIO: measured over 544 step records, the error ratio correlates with the order actually granted at only +0.059 and is flat across its own thirds, so it can say WHETHER to ask but not HOW MUCH -- the bound is the engine's own answer to that question. WHY NOT SIMPLY ASK FOR MORE: the ladder's ceiling is 5 and a request above the ceiling is unreachable (0 of 61 steps ever reached a demand of 6), so the useful request lives INSIDE the reachable range, which is what a quantile of the bound gives."}),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic) and 'order_by_bound' is on. 0 = off: the automatic demand follows the usual rules: the error gate, or the per-pixel validity bound where there is one. Above 0, the demand becomes that quantile of the per-pixel validity bound, i.e. of the highest order the sampler's own error test allows at each pixel. 0.5 asks for the middle of that range, 1.0 for the maximum. Experimental: the demand can jump between low and high instead of varying smoothly, so 0 is the safe setting."}),
                 "order_floor_adaptive_graded": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("order_floor_adaptive_graded", True)),
-                    "tooltip": "ONLY ACTS WHEN `order_floor` IS 0 (AUTOMATIC). ON, the shipped default: when the automatic gate opens, the order it ASKS FOR SCALES WITH THE ERROR instead of jumping straight to the maximum -- about 4 at the bottom of the gate's range and 5 near the top, so it asks for what the engine actually uses at that error level. OFF restores the previous behaviour exactly (a flat demand of 6 whenever the gate is open), which is what makes the two comparable in one test. GROUNDED, NOT CHOSEN: measured over the gated runs, the order the engine actually uses above the gate's trigger is p25 4.17 / p50 4.53 / p75 4.88, while at or below the trigger it is 1.81 / 2.41 / 2.85 -- so usage rises with the error, and a flat 6 asks for more order than the engine uses anywhere in that range."}),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic) and the demand comes from the error gate rather than the per-pixel validity bound. On: as the run's error rises above the gate threshold, the demanded order ramps from 'order_floor_adaptive_lo' to 'order_floor_adaptive_hi' instead of jumping straight to the maximum. Off: the demand is flat at 6 whenever the gate is open. On asks for roughly the order the sampler actually uses at that error level."}),
 
                 # ---- THE GRADED CURVE'S ENDPOINTS, APPENDED LAST (rule 35).  They were cfg-read constants with
                 # no emitter, which meant neither the UI nor a batch graph could set them -- and a value that
@@ -305,15 +301,15 @@ class ResearchAFlopsDebugOptions:
                 "order_floor_adaptive_lo": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_floor_adaptive_lo", 4.0)),
                     "min": 1.0, "max": 10.0, "step": 0.5,
-                    "tooltip": "ONLY ACTS WHEN `order_floor` IS 0 (AUTOMATIC) AND `graded` IS ON. The order the automatic mode asks for at the BOTTOM of the gate's error range, i.e. just above the trigger -- the curve ramps from here up to `hi` as the run's measured error rises. The shipped 4.0 is DERIVED, not chosen: measured over the gated runs, the order the engine actually uses just above the trigger is p25 4.17 / p50 4.53 / p75 4.88. Setting `lo` equal to `hi` gives a flat demand at that level, i.e. the old behaviour; setting `lo` above `hi` is allowed and inverts the ramp, which is almost certainly wrong."}),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic), 'order_floor_adaptive_graded' is on and the demand comes from the error gate. The order demanded just above the gate threshold, where the ramp starts. As error rises, the demand moves from here toward 'order_floor_adaptive_hi'. Setting it equal to 'order_floor_adaptive_hi' gives a flat demand; setting it higher than 'order_floor_adaptive_hi' inverts the ramp and is almost certainly wrong."}),
                 "order_floor_adaptive_hi": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_floor_adaptive_hi", 5.0)),
                     "min": 1.0, "max": 10.0, "step": 0.5,
-                    "tooltip": "ONLY ACTS WHEN `order_floor` IS 0 (AUTOMATIC) AND `graded` IS ON. The order the automatic mode asks for at the TOP of the error range (at or above `r_hi`), i.e. how hard it pushes when the run is struggling most. The shipped 5.0 is DERIVED: it is the p75 of the order the engine actually uses above the trigger, and the reason the old flat demand of 6 was an over-ask is that the engine never uses more than about 5 there. RAISING THIS ABOVE 6 asks for more order than the previous behaviour did -- legitimate to try, but it is the direction that already looked like over-asking."}),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic), 'order_floor_adaptive_graded' is on and the demand comes from the error gate. The order demanded at the top of the error range, i.e. when the run is struggling most. As error rises, the demand moves from 'order_floor_adaptive_lo' to here. Values above 6 ask for more order than the previous fixed demand did."}),
                 "order_floor_adaptive_r_hi": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_floor_adaptive_r_hi", 0.3031)),
                     "min": 0.06, "max": 2.0, "step": 0.01,
-                    "tooltip": "ONLY ACTS WHEN `order_floor` IS 0 (AUTOMATIC) AND `graded` IS ON. The run's measured error over tolerance at which the demand reaches `hi` and stops rising -- the WIDTH of the ramp. Smaller means the curve reaches full strength sooner (a more aggressive ramp just above the trigger); larger means it stays gentle for longer. Must stay ABOVE the trigger (`order_floor_adaptive_rtol`), otherwise the ramp is degenerate and the demand jumps straight to `hi`. The shipped 0.3031 is DERIVED: it is the p90 of the observed error ratio above the trigger."}),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic), 'order_floor_adaptive_graded' is on and the demand comes from the error gate. The error-over-tolerance level at which the demand reaches 'order_floor_adaptive_hi'. Smaller values reach full demand sooner; larger values keep the ramp gentle for longer. Must stay above 'order_floor_adaptive_rtol', otherwise the ramp has no width and the demand jumps straight to the high value."}),
 
                 # ---- THE KREA2 TEST SET, APPENDED LAST (rule 35) so every existing workflow's
                 # POSITIONAL widget values keep their slots and the new ones simply take their defaults.
@@ -322,78 +318,78 @@ class ResearchAFlopsDebugOptions:
                 "ord_ema": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("ord_ema", 0.37)),
                     "min": 0, "max": 4, "step": 0.01,
-                    "tooltip": "How fast the sampler forgets its own recent innovation estimate (0 follows the newest sample, 1 never moves). Shipped 0.37, DERIVED on the anima corpus as alpha* = 1 - rho_1. **RE-DERIVED ON KREA2 it lands at 0.03-0.17 across four logged fields** -- every field agrees the estimate should lean harder on the newest sample -- which is why this is the first arm to test. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "How quickly the sampler forgets its recent estimate of which order predicts the image best. 0 uses only the newest step, 1 never updates, and values in between smooth the estimate: higher is steadier, lower reacts faster. Only used while the per-pixel order ladder is on ('order_pixel_adaptive')."}),
                 "order_max": ("INT", {
                     "default": int(ENGINE_DEFAULTS.get("order_max", 3)),
                     "min": 0, "max": 8, "step": 1,
-                    "tooltip": "The ceiling on how many previous steps the per-pixel order ladder may use. Shipped 3; 0 means 10 (the previous behaviour). 3 is a SAFE DEFAULT, not a measurement of your model: on a synthetic flow it kept fine detail in slow areas about four times better than 4, while 4 and 5 made a fast-changing area overshoot. HIGHER can sharpen detail and overshoot; LOWER is flatter and safer. A per-model value from the probe is not implemented yet."}),
+                    "tooltip": "The highest number of previous steps the per-pixel order ladder may use. Higher values can sharpen detail but may overshoot in fast-changing areas; lower values are flatter and safer. 0 means the default ceiling of 10, not zero order."}),
                 "order_elev_gain": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_elev_gain", 0.1)),
                     "min": 0, "max": 4, "step": 0.01,
-                    "tooltip": "How strongly the ladder is allowed to elevate a pixel's order. Raising it should show up as a higher achieved order on the steps the demand is already asking for. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "How easily the order ladder raises a pixel's order. The ladder raises an order when the next one predicts clearly better; higher values make it demand less improvement and so raise more readily. Only used when 'order_by_bound' is off; with it on, the validity bound chooses the order and this setting is ignored."}),
                 "order_demote_gain": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_demote_gain", 0.25)),
                     "min": 0, "max": 4, "step": 0.01,
-                    "tooltip": "How strongly the ladder may push an order DOWN. This is the counterpart of the elevation gain and the other candidate explanation for the tail's drop to 4. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "How hard it is for the order ladder to drop a pixel's order. The ladder drops an order when the current one predicts clearly worse; higher values demand a bigger difference and so drop less readily. Only used when 'order_by_bound' is off; with it on, the validity bound chooses the order and this setting is ignored."}),
                 "guard_ratio": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("guard_ratio", 3.0)),
                     "min": 0, "max": 12, "step": 0.01,
-                    "tooltip": "How far outside its own neighbourhood a step must be before the guard acts. MEASURED: on 672 krea2 steps the guard fired on 0 % and `guard_sev` never left 1.0, i.e. it carried no signal at all -- so lowering this is how you find out whether it should be acting. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "The guard holds back a step that moves far more than recent steps. Besides the step-to-step change test, the guard also flags a step when its movement is more than this many times the recent typical level. Lower values make the guard fire more easily; higher values make it rarer."}),
                 "guard_sensitivity": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("guard_sensitivity", 2.5)),
                     "min": 0, "max": 10, "step": 0.01,
-                    "tooltip": "The guard's sensitivity. Ships at 2.5; paired with guard_ratio, this decides whether anything is ever held back. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "The guard's main sensitivity. A step's change is compared with the normal change over recent steps; higher values require a bigger outlier before the guard acts, lower values make it more nervous."}),
                 "an_value": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("an_value", 2.5)),
                     "min": 0, "max": 10, "step": 0.01,
-                    "tooltip": "The anomaly detector's value threshold -- how abrupt a local change must be to count as an anomaly. MEASURED on krea2: it fired on 0.4 % of steps, so this is the knob that decides whether that mechanism exists at all for a given model family. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "The anomaly detector's value test: how strongly a region must stand out from its surroundings in value (roughly, brightness) before that region can be treated as an anomaly. Lower values catch more regions, higher values only stronger ones. The detector starts partway into the run; 'an_from' sets where."}),
                 "an_from": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("an_from", 0.15)),
                     "min": 0, "max": 4, "step": 0.01,
-                    "tooltip": "The noise level at which the anomaly detector starts looking. Ships at 0.15. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "How far into the run the anomaly detector starts, as a fraction of the total steps. 0.15 means roughly the first 15% of steps are ignored. Higher values delay detection; lower values let it catch problems earlier. This is a fraction of the run, not a noise level."}),
                 "wmax_adapt": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("wmax_adapt", False)),
-                    "tooltip": "Turns the ADAPTIVE end-of-run error limit on. Ships OFF, and the krea2 corpus was therefore run entirely with the fixed limit -- an arm that has never been tested."}),
+                    "tooltip": "Lets the cap on extrapolation order fall while a step's error is high. Off: the cap stays at its fixed maximum. On: a step whose previous error was well over tolerance gets a lower cap, so the sampler takes fewer high-order risks while it is struggling. This is the cautious direction; leave it off unless you are testing overshoot."}),
                 "wmax_adapt_k": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("wmax_adapt_k", 0.5)),
                     "min": 0, "max": 4, "step": 0.01,
-                    "tooltip": "How fast that adaptive limit responds when wmax_adapt is on. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "Only used when 'wmax_adapt' is on. How far the cap may fall when the previous error is high. Higher values allow a larger drop; lower values keep the cap closer to its fixed maximum."}),
                 "corrector_ab": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("corrector_ab", True)),
-                    "tooltip": "The corrector's A/B arm. MEASURED on krea2: the corrector's weight is 0.175 on the worst quarter of steps against 0.768 on the best -- it backs off exactly where the error is worst, and whether that is the guard limiting it or a design choice is what this arm tests."}),
+                    "tooltip": "Chooses the corrector. On: the current corrector, which may blend back toward the plain step when the correction looks risky. Off: an older corrector that always takes the corrected step and uses the raw prediction. Off exists for comparison; leave it on unless you are reproducing an old run."}),
                 "rtol": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("rtol", 0.01)),
                     "min": 0, "max": 4, "step": 0.01,
-                    "tooltip": "The sampler's own error tolerance. `err/tol` climbs from 0.03 to 5.86 across a 16-step krea2 run because the tolerance shrinks as the run ends; how fast it may shrink is this number, which makes it the most direct lever on the unsettled tail. The range here is deliberately WIDE: the honest bound would be the clamp at the key's own read site, and the engine still applies that -- a test arm must not be silently clipped by a UI limit someone guessed."}),
+                    "tooltip": "How much error the sampler accepts on a step. Lower is stricter: it falls back to the plain step more often, which is safer but can lose detail. Higher lets it take the more ambitious correction more often, which can add detail but risks overshoot. Other error checks compare against this value."}),
                 # ---- THE GUARD FAMILY AND THE TWO GATES, APPENDED LAST (rule 35).  The guard halves the
                 # krea2 tail error when it fires; the two gates below are what make the order-gain widgets
                 # and the whole per-pixel order machinery testable at all.  Why: DEAD_FEATURES.md.
                 "guard_window": ("INT", {
                     "default": int(ENGINE_DEFAULTS.get("guard_window", 8)),
                     "min": 0, "max": 32, "step": 1,
-                    "tooltip": "How many recent steps the guard looks back over to judge whether a step is an outlier. Ships at 8. The guard is the ONLY mechanism in this corpus that measurably improves a krea2 run: acting on ONE step of sixteen HALVES the raw tail error, with the firing threshold between 1.5 and 2.5 (guard_sensitivity). So the width of the window it judges from is a live question, and it was unreachable until now."}),
+                    "tooltip": "How many recent steps the guard remembers when judging whether the current step is an outlier. A longer window is steadier; a short one reacts faster but can be fooled by one unusual step. Values below 4 are treated as 4."}),
                 "guard_quantile": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("guard_quantile", 0.99)),
                     "min": 0.0, "max": 1.0, "step": 0.001,
-                    "tooltip": "The quantile of THIS STEP's per-pixel jump signal that counts as the guard's reading. Ships at 0.99 -- i.e. the guard compares against almost the most extreme pixel in the step, which is a conservative choice worth testing in the other direction. It is not a quantile over the recent steps; guard_window is the history."}),
+                    "tooltip": "Which level of the current step's movement the guard judges. The guard reduces the step's per-pixel movement to one number, and this chooses that number as a quantile: 0.99 means almost the most extreme pixel, 0.5 the median. High values make the guard react only to the worst-moving pixels; lower values make it react to more of the image. This is not a count of past steps."}),
                 "guard_floor": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("guard_floor", 0.1)),
                     "min": 0, "max": 4, "step": 0.001,
-                    "tooltip": "The floor on the guard's scale, so a very quiet history cannot make it hypersensitive."}),
+                    "tooltip": "The smallest threshold the guard will use, as a fraction of the recent typical movement. It stops a very quiet stretch from making the guard fire on tiny changes. Raise it to make the guard calmer in quiet runs."}),
                 "guard_hold": ("INT", {
                     "default": int(ENGINE_DEFAULTS.get("guard_hold", 2)),
                     "min": 0, "max": 8, "step": 1,
-                    "tooltip": "How many steps a guard decision is held for before it may change again. Ships at 2; a hold of 1 lets it act every step, a larger hold makes it a slower, steadier response."}),
+                    "tooltip": "How many steps the guard stays active after it fires before it can change its mind. 1 lets it react every step; larger values give a slower, smoother response."}),
                 "guard_mad_floor": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("guard_mad_floor", 0.1)),
                     "min": 0, "max": 4, "step": 0.001,
-                    "tooltip": "The floor on the guard's MAD-based scale estimate, the robust counterpart of guard_floor."}),
+                    "tooltip": "The smallest spread the guard assumes when measuring how unusual a step is, as a fraction of the recent typical movement. It stops the guard becoming hypersensitive when recent steps barely change. Raise it to make the guard calmer in very steady runs."}),
                 "order_by_bound": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("order_by_bound", True)),
-                    "tooltip": "THE GATE THAT MAKES TWO OTHER WIDGETS REAL. `order_elev_gain` and `order_demote_gain` sit in the `else:` branch of `if _order_by_bound:` (aflops.py 10376-10400), so while this is ON and the bound is available those two widgets CANNOT FIRE -- measured: both produced a bit-identical latent at outlandish values. Turning this OFF is the only way to test them."}),
+                    "tooltip": "How the per-pixel order is chosen. On: the highest order whose own error estimate still fits the step tolerance (the validity bound). Off: the order whose prediction comes closest to the final image. On is more permissive in smooth areas and stricter in rough ones. While it is on, 'order_elev_gain' and 'order_demote_gain' are not used."}),
                 "order_pixel_adaptive": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("order_pixel_adaptive", True)),
-                    "tooltip": "The gate on the whole per-pixel order machinery. It defaults ON, and it is the condition that guards several of the order knobs -- including `order_max`, which was measured BELOW REACH. Turning it OFF is how you find out what that machinery is actually worth on a given model family."}),
+                    "tooltip": "Turns the per-pixel order ladder on or off. On: each pixel gets its own order, so detailed and smooth areas can be treated differently. Off: one order for the whole image, which is simpler and cheaper. This is the main switch for the order settings on this node."}),
                 # APPENDED LAST (rule 15).  It was frozen OFF and off the UI in the
                 # release build (see the note above), which made the per-step fusion's
                 # advertised 'take the lower order when the probes disagree' rule
@@ -404,29 +400,65 @@ class ResearchAFlopsDebugOptions:
                 # rule switchable -- and testable.
                 "wmax_bound": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("wmax_bound", False)),
-                    "tooltip": "Which rule decides the sampler's extrapolation ORDER. OFF (the default) is what the sampler has always done: an order is allowed when its largest extrapolation weight is under the cap. ON adds the paper's remainder test -- the order's own truncation error at THIS step's spacing must also stay inside the step tolerance, using the per-order derivative scale the probe measured -- so an order the trajectory's own smoothness does not justify is refused even when its weights look small. It is also what the per-step probe fusion's 'when the two probes disagree, take the lower order' rule needs -- but that rule does not work on either setting: the two caps it compares come out identical, so it cannot lower an order. Treat that rule as NOT shipped. MEASURED, NOT NEUTRAL, AND THE DIRECTION IS MODEL-SPECIFIC: through the per-step fusion on krea2Turbo it refused enough orders to take the mean admitted order from 4-5 down to 1-2, while on mklanKrea2 it admitted order 5 at every step and the run's cap rose from 1.94-2.14 (order 3) to 3.28125 (order 5). OFF is the shipped value; ON is for testing which way your model goes. Toggling it starts a fresh probe on the next run, because the value is part of the probe's cache key."}),
+                    "tooltip": "Adds a second test before an order is allowed. Off: an order is allowed when its largest extrapolation weight is under the cap. On: its own truncation error at this step's spacing must also fit the step tolerance, so a smoothness argument can refuse an order the weight cap would allow. Off is the safer default; on can change the image noticeably, and the direction depends on the model."}),
                 # APPENDED LAST (rule 15).  The dial the operator asked for after seeing a
                 # real ON/OFF difference on a krea checkpoint and being unable to call it.
                 "order_bound_blend": ("FLOAT", {
                     "default": float(ENGINE_DEFAULTS.get("order_bound_blend", 1.0)),
                     "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Only does anything while `order_by_bound` is ON. It scales how much of each pixel's order comes from the remainder criterion instead of the 'which order predicts x0 best' rule: 0.0 leaves the order exactly as the OFF arm has it, 1.0 is the criterion's own answer (the shipped behaviour), and 0.5 means a pixel whose two answers are order 1 and order 4 runs at order 2. WHY IT EXISTS: the two endpoints can look clearly different without either being obviously better, and a verdict imposed from a metric is not a verdict. Sweep it -- 0.25, 0.5, 0.75, 1.0 at the same seed -- and keep the value that looks best to you; the value in force is written to the run log as `order_bound_blend`, and the order actually used as `ord_mean` per step."}),
+                    "tooltip": "Only used when 'order_by_bound' is on. Blends the two order choices: 0 uses the order that best predicts the image, 1 uses the validity bound, and values in between mix them. 0.5 means a pixel whose two answers are order 1 and order 4 runs at order 2. Adjust it when both extremes look plausible but neither is clearly better."}),
                 # APPENDED LAST (rule 15): the bound's own map as the request.
                 "order_demand_bound": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("order_demand_bound", True)),
-                    "tooltip": "ON, the shipped default: on any step where the per-pixel validity bound was computed, the request is 'raise nothing' -- the bound's own map already says which order each pixel's smoothness justifies, so the error gate's ramp cannot push an order past it. OFF restores the ramp everywhere. It only acts when `order_floor` is 0 (AUTOMATIC) and `order_by_bound` is ON, and an explicit `order_demand_q` above 0 still selects the quantile request. A SAVED node keeps its own value, so this default governs new nodes; the log stamps the policy each step in `ord_demand_policy` ('bound_map' / 'bound' / 'graded') and the level in force in `ord_demand`."}),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic) and 'order_by_bound' is on. On: on steps where the validity bound was computed, the sampler adds no extra demand, because the bound already sets a safe order for each pixel. Off: the error-gate demand applies everywhere. Setting 'order_demand_q' above 0 overrides this."}),
                 # APPENDED LAST (rule 15): the per-pixel history-consistency gate A/B.
                 "hist_cos_per_pixel": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("hist_cos_per_pixel", True)),
-                    "tooltip": "ON (shipped): the history-consistency cosine is computed per pixel; only the locally reversing pixels go to order 1, so a volatile corner no longer removes the per-pixel order ladder from a detailed area. OFF: the old whole-image gate -- one negative cosine switches the ladder off for EVERY pixel; on the saved runs that happened on 88.8% of the steps that were about to use order 2 or higher. ON raises the admitted order on those steps and costs some trajectory error; the operator's paired tests preferred it on anima, krea and moss. Only acts while the per-pixel order ladder is on (`order_pixel_adaptive`); with the ladder off, the whole-image gate still applies. The per-step log records the gated fraction as `hist_cos_px_neg`; the run config records `hist_cos_per_pixel`."}),
+                    "tooltip": "Controls how a change of direction affects the per-pixel order ladder. On: only pixels that actually reverse direction drop to order 1, so one busy corner does not flatten the whole image. Off: a single reversal anywhere drops every pixel to order 1. On gives more order and detail in mixed areas and can cost some accuracy. Only used while 'order_pixel_adaptive' is on; with it off, the whole image is still gated as one."}),
                 # APPENDED LAST (rule 15): the per-pixel gate on the second-order term A/B.
                 "second_order_per_pixel": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("second_order_per_pixel", True)),
-                    "tooltip": "ON (shipped): the exponential integrator's second-order slope term is applied only to pixels whose admitted per-pixel order is 2 or more; the volatile pixels the order map keeps at order 1 stay on the first-order step, which is the stable one. OFF: the old global term -- applied to EVERY pixel whenever the step's order cap is 2 or more. The operator's paired tests preferred ON. The per-step log records the fraction of pixels that received the term as `second_order_px`; the run config records `second_order_per_pixel`."}),
+                    "tooltip": "Controls where the second-order correction is applied. On: only to pixels whose own order is 2 or higher, leaving volatile pixels on the safer first-order step. Off: to every pixel whenever the step's order cap is 2 or higher. On is more careful in rough areas."}),
                 # APPENDED LAST (rule 15): the raw-lambda slope A/B.
                 "second_order_raw_lambda": ("BOOLEAN", {
                     "default": bool(ENGINE_DEFAULTS.get("second_order_raw_lambda", True)),
-                    "tooltip": "ON (shipped): the second-order slope term and its phi2 coefficient use the UNCLAMPED lambda, while the first-order decay stays clamped. OFF: the whole slope term uses the clamped lambda. The clamp is active on every step, so the clamped slope carries a residual that does not shrink with the step count; ON removes it. The paired runs measured the two arms as identical where the clamp does not bind and slightly lower step error where it does; OFF restores the clamped form. The per-step log records `second_order_raw`; the run config records `second_order_raw_lambda`."}),
+                    "tooltip": "Controls the value used inside the second-order correction. On: use the unclamped estimate, so the correction does not carry a leftover bias from the clamp. Off: use the clamped value. The difference is small when the clamp is not active and can slightly reduce step error where it is."}),
+
+                # ==================================================================================
+                # THE 2026-10-19 PER-STEP AUDIT'S A/B ARMS -- APPENDED LAST (rule 15), ALL OFF.
+                # These are EXPERIMENTS, not finished settings.  Each one is OFF by default, and
+                # with all eight OFF this node emits exactly what it emitted before.  To test one,
+                # connect this node to the Sampler's `options+`, turn ONE of them ON, and re-run
+                # the same prompt, seed and schedule as the OFF run.  Each arm writes the value it
+                # put in force to that run's own log, so the two runs are attributed from their
+                # records rather than from a filename.  Findings:
+                # findings/2026-10-19-per-step-audit/.
+                # ==================================================================================
+                "tol_step_du": ("BOOLEAN", {
+                    "default": bool(ENGINE_DEFAULTS.get("tol_step_du", False)),
+                    "tooltip": "Gives each step its own tolerance based on its length: a long step gets a looser tolerance, a short step a tighter one. Off: one tolerance for the whole run. It changes both the corrector's blend and the safety cut. Do not turn it on together with 'tol_from_curve'; if both are on, 'tol_from_curve' wins."}),
+                "hist_cos_quantile": ("FLOAT", {
+                    "default": float(ENGINE_DEFAULTS.get("hist_cos_quantile", 0.0)),
+                    "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Changes the direction-reversal test from a sign check to a quantile. 0 keeps the sign check: every pixel whose direction reverses is sent to order 1. Above 0, that fraction of the most-reversing pixels is sent to order 1, so 0.05 affects only the worst 5% instead of every pixel that reverses. Only has its per-pixel effect when 'hist_cos_per_pixel' is on; otherwise the whole image is gated as one."}),
+                "probe_dk_per_side": ("BOOLEAN", {
+                    "default": bool(ENGINE_DEFAULTS.get("probe_dk_per_side", False)),
+                    "tooltip": "Only matters when 'probe_fuse_per_step' is on. Off: both measurements share one error scale, so they always allow the same order and the 'take the lower order' rule cannot fire. On: each measurement carries its own scale, so the two can disagree and the lower order is taken. Off is the safer default."}),
+                "dk_series_step": ("BOOLEAN", {
+                    "default": bool(ENGINE_DEFAULTS.get("dk_series_step", False)),
+                    "tooltip": "How the order test's error scale is chosen. Off: use one run-wide median measured by the Autotuner. On: use the Autotuner's value at this step's own noise level, falling back to the median when that value is missing. On adapts to schedules whose steps differ a lot. It only changes the order test, so it does nothing unless 'wmax_bound' is on."}),
+                "second_order_jump_mask": ("BOOLEAN", {
+                    "default": bool(ENGINE_DEFAULTS.get("second_order_jump_mask", False)),
+                    "tooltip": "Only used when 'second_order_per_pixel' is on. On: apply the correction only to pixels in the calmer half of this step's movement, keeping it away from sharp changes. Off: apply it to every pixel that qualifies by order. On narrows where the correction acts."}),
+                "order_floor_norm": ("BOOLEAN", {
+                    "default": bool(ENGINE_DEFAULTS.get("order_floor_norm", False)),
+                    "tooltip": "Only used when 'order_floor' is 0 (automatic). Off: the gate compares a step's error-over-tolerance with the fixed threshold. On: it compares against what the Autotuner measured as normal for this part of the run, so the gate opens on steps that are worse than expected rather than on steps that merely come early in a decaying run. Falls back to the fixed test when the Autotuner has no curve."}),
+                "tol_from_curve": ("BOOLEAN", {
+                    "default": bool(ENGINE_DEFAULTS.get("tol_from_curve", False)),
+                    "tooltip": "Takes each step's tolerance from the Autotuner's measured error curve instead of using one run-wide tolerance. It acts on the same two checks as 'tol_step_du'; if both are on, 'tol_from_curve' wins. Falls back to the run tolerance when the curve is missing or too short."}),
+                "fuse_step_h": ("BOOLEAN", {
+                    "default": bool(ENGINE_DEFAULTS.get("fuse_step_h", False)),
+                    "tooltip": "Only used when 'probe_fuse_per_step' is on. Off: the combination uses the run's average step spacing. On: it uses each step's own spacing, which matters when the end of the schedule has much longer steps than the start. A uniform schedule behaves the same either way."}),
             },
             # CHAINING (2026-10-04).  Until this input existed only the Sampler could RECEIVE
             # options, so two options-producing nodes could not both drive a run -- the operator's
@@ -434,7 +466,7 @@ class ResearchAFlopsDebugOptions:
             # have multiple chained options (scheduler+debugoptions) this way."*  It is OPTIONAL:
             # with nothing connected this node behaves exactly as before.
             "optional": {
-                "options+": (OPT_TYPE, {"tooltip": "Connect another PD-AOS Options node here (the Autotuner's `options` output, or another Debug Options node) and this node passes its settings through, adding or overriding its own on top. Chain them in the order you want them applied: the node CLOSEST to the Sampler wins on any field two of them both set."}),
+                "options+": (OPT_TYPE, {"tooltip": "Connect another PD-AOS Options node here (the Autotuner's options output or another Debug Options node). Its settings pass through, and this node overrides them where both set the same field. The node closest to the sampler wins."}),
             },
         }
 
@@ -481,6 +513,15 @@ class ResearchAFlopsDebugOptions:
                     ENGINE_DEFAULTS.get("second_order_per_pixel", True)),
                 second_order_raw_lambda=bool(
                     ENGINE_DEFAULTS.get("second_order_raw_lambda", True)),
+                tol_step_du=bool(ENGINE_DEFAULTS.get("tol_step_du", False)),
+                hist_cos_quantile=float(ENGINE_DEFAULTS.get("hist_cos_quantile", 0.0)),
+                probe_dk_per_side=bool(ENGINE_DEFAULTS.get("probe_dk_per_side", False)),
+                dk_series_step=bool(ENGINE_DEFAULTS.get("dk_series_step", False)),
+                second_order_jump_mask=bool(
+                    ENGINE_DEFAULTS.get("second_order_jump_mask", False)),
+                order_floor_norm=bool(ENGINE_DEFAULTS.get("order_floor_norm", False)),
+                tol_from_curve=bool(ENGINE_DEFAULTS.get("tol_from_curve", False)),
+                fuse_step_h=bool(ENGINE_DEFAULTS.get("fuse_step_h", False)),
  **kw):
         # The Sampler merges this dict into its own cfg BEFORE the Autotuner's options, so a
         # Debug node wins over a probe-side default and can be flipped without touching either
@@ -545,6 +586,18 @@ class ResearchAFlopsDebugOptions:
             "hist_cos_per_pixel": _b(hist_cos_per_pixel),
             "second_order_per_pixel": _b(second_order_per_pixel),
             "second_order_raw_lambda": _b(second_order_raw_lambda),
+            # THE 2026-10-19 AUDIT ARMS.  Widget, parameter and emission are the three ends
+            # that must all exist (rule 14); each is OFF by default, so a graph that never
+            # sets it emits the shipped value.  The connectivity rigs census them in both
+            # directions, and each arm stamps its value in force in the run log.
+            "tol_step_du": _b(tol_step_du),
+            "hist_cos_quantile": max(0.0, min(1.0, _f(hist_cos_quantile))),
+            "probe_dk_per_side": _b(probe_dk_per_side),
+            "dk_series_step": _b(dk_series_step),
+            "second_order_jump_mask": _b(second_order_jump_mask),
+            "order_floor_norm": _b(order_floor_norm),
+            "tol_from_curve": _b(tol_from_curve),
+            "fuse_step_h": _b(fuse_step_h),
             "order_floor_adaptive_r_hi": max(0.06, min(2.0, _f(order_floor_adaptive_r_hi))),
         })
         return (out,)
@@ -552,21 +605,14 @@ class ResearchAFlopsDebugOptions:
 
 class ResearchAFlopsNoiseOptions:
     DESCRIPTION = (
-        "PD-AOS Noise (ETA) Options - every stochasticity control in ONE node. "
-        "The Sampler carries only what you touch every day and the Debug Options "
-        "node carries only switches that REACHED A DECISION; ancestral noise has "
-        "not reached one, so it lives here instead of diluting either. NOTHING "
-        "HERE IS A FINISHED SETTING. "
-        "Wiring: chain it between the Autotuner and the Sampler "
-        "(Autotuner 'options' -> this node's 'options+' -> Sampler 'options+'). "
-        "Order matters only where two nodes set the same field, and the node "
-        "CLOSEST to the Sampler wins. "
-        "Its defaults are chosen so that CONNECTING IT DOES SOMETHING: the noise "
-        "window is opened and, when eta is above zero, the probe path the escape "
-        "needs is enabled. Connected to a graph with no Autotuner, it behaves "
-        "like one running the Autotuner's own defaults rather than like a "
-        "standalone run -- in a standalone run the engine zeroes all three escape "
-        "thresholds and every widget here would silently do nothing.")
+        "PD-AOS Noise (ETA) Options: all of the sampler's ancestral-noise controls in one "
+        "node. Use it to add random noise back during sampling, for example to help a run "
+        "whose image looks stuck or flat. 'eta' sets the maximum amount, and 0 turns noise "
+        "off; 'eta_mode' chooses where the noise is applied. Connect this node's 'options' "
+        "output to the Sampler's 'options+' input, directly or through another Options "
+        "node; the node closest to the Sampler wins. When eta is above 0, connecting this "
+        "node also opens the noise window and supplies the probe settings the stall "
+        "detector needs, so it works without an Autotuner.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
@@ -575,37 +621,37 @@ class ResearchAFlopsNoiseOptions:
             "required": {
                 "eta": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "HOW MUCH ancestral noise, on the same scale as every other sampler's eta: 0 is the fully deterministic sampler, 0.1 is the value you found helpful elsewhere. This is the ceiling on what the engine may inject, and it is the SAME key the old 'stochasticity' slider fed, so a saved graph or an Options node that still sets that name sets this one. What it means depends on 'eta_mode': with 'adaptive' the noise actually injected is eta x the detector's stuck signal, so it fires only where the trajectory has stalled and never reaches eta; with the other modes it is the level across the whole run."}),
+                    "tooltip": "How much random noise is added back at each step, on the same scale as other samplers' eta: 0 is fully deterministic, 0.1 is a typical gentle setting. It is the ceiling, not always the amount used: the mode decides where and how much is applied. With 'adaptive' the amount is scaled by the stall detector and never reaches eta; the other modes use it across the run. It also caps the level when 'eta_from_probe' is on."}),
                 "eta_mode": (["adaptive", "constant", "cosine", "linear",
                               "exponential", "sigma_power"], {
                     "default": "adaptive",
-                    "tooltip": "WHERE the noise goes, and the single most useful switch here. 'adaptive' injects ONLY on the steps where the engine's local-minimum detector fires (the trajectory's movement has collapsed and the image is still flat, or the update has reversed direction) -- that is the escape, and it needs the probe path to be live. 'constant' injects the full eta on every step, 'cosine' and 'linear' fade eta to zero across the run, 'exponential' and 'sigma_power' fade it on the sigma schedule instead. 'constant' is the arm that was reported as washing out structure; every fading mode keeps the noise out of the endgame. The level actually used each step is stamped in the run log as 'eta_eff', and the detector's own reading as 'eta_stuck'."}),
+                    "tooltip": "Where the noise goes. 'adaptive': only on steps where the sampler detects a stall, so it acts as an escape and needs a working measurement from the Autotuner. 'constant': the full eta on every step. 'cosine' and 'linear': fade from eta to zero over the run. 'exponential' and 'sigma_power': fade according to the noise level instead. Constant is the harshest; the fading modes keep noise out of the endgame."}),
                 "s_tmin": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.001,
-                    "tooltip": "The noise is applied only where sigma is ABOVE this, and the default here is deliberately 0.0 rather than the engine's own 1.0. This single number is what silently disabled every previous attempt: at 1.0 only the very first step qualifies, and that step has no trajectory history, so the detector cannot fire on it -- the only step allowed to make noise was the only step where the detector is blind. Connecting this node therefore OPENS the window. Raise it to keep noise out of the high-sigma steps, where the model is still deciding composition."}),
+                    "tooltip": "The lowest noise level that may receive noise. Noise is added only while sigma is at or above this value, so raising it stops noise in the late, low-noise part of the run where detail is being locked in. 0 means no lower limit. This is the lower end of the window, not the amount of noise."}),
                 "s_tmax": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.001,
-                    "tooltip": "The upper end of that window: 0.0 means NO upper bound, which is the engine's own convention. Set it above 0 to stop making noise below that sigma -- the noise needed early is often harmful in the endgame, and this is the blunt version of what the fade already does smoothly."}),
+                    "tooltip": "The highest noise level that may receive noise. Noise is added only while sigma is at or below this value, so setting it above 0 keeps noise out of the early, high-noise part of the run where composition is decided. 0 means no upper limit."}),
                 "escape": (["auto", "off"], {
                     "default": "auto",
-                    "tooltip": "Whether the local-minimum detector is allowed to fire, and it is a SWITCH rather than two threshold numbers on purpose. 'auto' lets the engine DERIVE the two firing thresholds from the probe's own measurement of your model -- how far a pixel normally moves per step, and how much high-frequency detail the image normally holds -- so the base is measured on the model in front of you rather than copied from another checkpoint. 'off' sets both to zero, which disables the escape without touching the noise level. The three numbers this resolves to are stamped in every run log ('eta_escape_jump', 'eta_escape_detail', 'eta_fade_sigma'), so 'auto' is never a black box. NOTE: if an upstream Options node sets either threshold explicitly, that value is used and this switch does not override it."}),
+                    "tooltip": "Whether the stall detector may add its escape nudge. 'auto' derives the firing thresholds from the Autotuner's measurement of your model, so they fit the model in front of you. 'off' disables the detector without changing the noise level. If another Options node sets either threshold explicitly, that value is used and this switch does not override it."}),
                 "escape_gain": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 4.0, "step": 0.01,
-                    "tooltip": "Sensitivity of the escape, as a multiplier on the two thresholds 'auto' derives: 1.0 leaves the probe's measurement exactly as measured, above 1 makes the detector fire more readily (more steps get noise), below 1 makes it more reluctant, and 0 means it never fires. This exists so sensitivity is ONE number instead of two hand-set thresholds -- a threshold typed in for one model is a value from that model's population, and it would travel badly to the next checkpoint."}),
+                    "tooltip": "Scales the escape's sensitivity by multiplying the thresholds derived in 'auto' mode. 1.0 uses them as measured; above 1 fires more readily, so more steps get noise; below 1 is more reluctant; 0 disables the firing. Only used when 'escape' is 'auto'."}),
                 "fade_floor": ("FLOAT", {
                     "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "How much of the BASE floor (`eta_min`) survives the late fade. The shipped `eta_min` is 0.0 and has no widget, so this slider does nothing on a graph built from these nodes; it only matters if a custom Options node sets `eta_min` above zero. It does NOT fade the escape: a stuck trajectory still gets its nudge at the end."}),
+                    "tooltip": "How much of the base noise level survives the late fade. The base level is normally 0, so this does nothing on its own; it only matters if a custom Options node sets a base level above 0. It does not fade the stall escape: a stuck run still gets its nudge at the end."}),
                 "fade_sigma": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 1000.0, "step": 0.001,
-                    "tooltip": "Where the late fade begins, in sigma. The default -1 is 'auto': the engine uses the sigma where the probe measured your model's trajectory first reversing direction (or where it converged, if it never reverses), which is a measurement rather than a guess. Set a positive number to anchor the fade yourself."}),
+                    "tooltip": "Where the late fade begins, in noise level. -1 means automatic: use the point where the Autotuner measured your model's trajectory settling. Set a positive value to choose the point yourself. It also marks the noise level above which a change of direction is not treated as a stall."}),
                 "noise_survival_probe": (["follow eta", "force on", "force off"], {
                     "default": "follow eta",
-                    "tooltip": "Whether the probe measures how much of an injected perturbation still shows in the model's prediction a step later -- the measurement that says how big a kick THIS model can still correct at a given sigma, i.e. the budget any escape has to spend. 'follow eta' (the default) measures it whenever eta is above zero, which is the case that needs it; 'force off' skips it and saves up to ten model calls on the first run of a session, at the cost of not knowing the budget; 'force on' measures it even at eta 0, for inspecting the curve without generating noise."}),
+                    "tooltip": "Whether the Autotuner also measures how much of a small kick the model still corrects at a given noise level. 'follow eta' measures it whenever eta is above 0, which is when the budget matters. 'force off' skips it and saves some model calls on the first run. 'force on' measures it even at eta 0, for inspecting the curve."}),
             },
             # CHAINING, same convention as the Debug Options node: a node closest
             # to the Sampler wins where two of them set the same field.
             "optional": {
-                "options+": (OPT_TYPE, {"tooltip": "Connect another PD-AOS Options node here -- the Autotuner's 'options' output, or the Debug Options node -- and its settings pass through, with this node's own overriding on any field both set. Anything connected here also supplies the probe settings, which this node only fills in when nothing else did."}),
+                "options+": (OPT_TYPE, {"tooltip": "Connect another PD-AOS Options node here (the Autotuner's options output or the Debug Options node). Its settings pass through, and this node overrides them where both set the same field. The node closest to the sampler wins. Anything connected here also supplies the probe settings, which this node fills in only when nothing else did."}),
             },
         }
 
@@ -667,20 +713,13 @@ class ResearchAFlopsNoiseOptions:
 
 class ResearchAFlopsExperimental:
     DESCRIPTION = (
-        "PD-AOS Experimental Options - a deliberately VOLATILE node. "
-        "Its whole purpose is to let a test arm be added or REMOVED without the "
-        "widget-ordering risk that governs every other node here: ComfyUI stores "
-        "a UI graph's widget values POSITIONALLY, so dropping a widget from the "
-        "middle of a stable node re-maps every later value onto the wrong widget, "
-        "silently. THIS node is exempt because it is only ever used for testing, "
-        "and nothing saved depends on it. "
-        "EVERY SWITCH HERE DEFAULTS TO THE OLD BEHAVIOUR, so connecting it "
-        "changes nothing until you set one, and disconnecting it returns the "
-        "graph to the shipped path. "
-        "Wiring: chain it anywhere in the options chain "
-        "(Autotuner 'options' -> this node's 'options+' -> Sampler 'options+'). "
-        "Order matters only where two nodes set the same field, and the node "
-        "CLOSEST to the Sampler wins.")
+        "PD-AOS Experimental Options: switches for testing one change at a time. Every "
+        "switch defaults to the normal behaviour, so connecting this node changes nothing "
+        "until you set one. Connect its 'options' output to the Sampler's 'options+' input, "
+        "or chain it through another Options node; the node closest to the Sampler wins "
+        "where two set the same field. These switches are experimental and may change or "
+        "disappear between releases; use the stable Options nodes for settings you want to "
+        "keep.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
@@ -689,30 +728,30 @@ class ResearchAFlopsExperimental:
             "required": {
                 "escape_mode": (["flatness", "momentum"], {
                     "default": "flatness",
-                    "tooltip": "WHICH CONDITIONS MAY ARM THE ESCAPE'S STALL DETECTOR. 'flatness' is what the sampler has always done, and is left exactly as it was. 'momentum' ADDS a second way to arm it -- it does not replace the first, and it does not touch the reversal detector, so an A/B changes ONE thing. WHY THE SECOND WAY EXISTS, measured on the first build that shipped the Noise (ETA) Options node (7 runs, 5 checkpoints): the sampler's stall test multiplies 'the movement has collapsed' by 'the image is still flat', and those two quantities move in OPPOSITE directions as a run converges -- the movement falls while the high-frequency detail RISES as the picture forms. Their product read exactly 0.0000 on every one of those runs AT THE SHIPPED SENSITIVITY (gain 1.0); raising the gain does reach it -- gains of 1.5 to 4.0 armed 1 to 39 steps across the ten runs measured -- but a gain high enough to arm it also noises steps that did not need it, and centring both thresholds on each run's own measured medians still armed 1 step out of 252. 'momentum' arms the same half of the detector from a run-relative test instead: the per-step movement has fallen to 70% or less of its own median over the last 4 steps AND the detail has not grown by more than 15% over that window. On that same corpus it arms 2-5 steps per run, in the middle of the run rather than the endgame. IT IS A TEST ARM, NOT AN IMPROVEMENT: nothing here can say whether the extra noise looks better, which is exactly what this node is for. Both arms are readable from the run log -- `escape_mode` in the config, and per step `eta_momentum`, `eta_momentum_ratio` and `eta_growth_rate`, which are stamped on BOTH arms so the two can be compared."}),
+                    "tooltip": "Which stall test can trigger the escape noise. 'flatness' is the original test: movement has collapsed and the image is still flat. 'momentum' adds a second test: movement has fallen to about 70% or less of its recent normal while detail has not grown by more than a small allowance, and it also requires a flat image when 'escape_momentum_flatness' is on. The momentum test does not replace the flatness test; either can fire."}),
                 "noise_survival_curve": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "MEASUREMENT AND INPUT -- on its own it changes nothing the sampler does, but `eta_from_probe` / `eta_budget_from_probe` READ this curve, and turning either of those on records it automatically. Off is the delivered behaviour. On makes the model probe RECORD the noise-absorption measurement instead of only reducing it to one number: at four sigmas spread across your run's range it injects a perturbation at up to four amplitudes and writes down how far that perturbation still shows in the model's next prediction, as a fraction of an unperturbed reference. WHAT THE NUMBERS MEAN: a small value means the model corrected the kick, i.e. this model at this sigma will not let noise survive; a value near 1 means the kick persisted. That curve is the empirical form of 'how much noise can this model absorb here', which is the quantity a principled noise schedule would be derived from rather than hand-tuned. WHY IT IS NOT ALREADY THERE: the measurement has always been computed and then immediately compared against a fixed 0.35 to produce a single number, so the only surviving record was that number -- and across 10,602 logged profiles it is missing in 69% of them and sits at the clamp or the skipped-probe fallback in most of the rest, so it has rarely carried a usable per-model reading. THE LADDER WAS ALSO TOO NARROW TO SEE THE SHAPE: three separate measurement rounds never sampled above sigma 0.66, and the amplitude ladder stopped at 0.35, which truncated exactly the region where the model stops correcting. It now spans your run's own sigma range and records every rung, including the one that failed. COST: one model call per sigma/amplitude pair plus one reference call per sigma -- around 20 calls on the first run for a model, on the PROBE path only, then cached. It does NOT add per-step model calls, so generation speed after the first run is unchanged. Read it in the run log as 'noise_survival_curve'; each entry carries the sigma, the amplitude, the divergence, the two norms the ratio was built from, and whether it passed the threshold."}),
+                    "tooltip": "Records how much of a small kick the model still corrects at several noise levels. It changes nothing by itself; it is the measurement 'eta_from_probe' and 'eta_budget_from_probe' read, and either of those turns it on automatically. Recording it costs extra probe calls on the first run for a model, not per step."}),
                 "eta_from_probe": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Derive the noise level from the probe's own measurement of your model, instead of inferring it from whether the image looks stuck. OFF is the delivered behaviour. HOW IT WORKS: the probe already injects a perturbation one step ahead and measures how much of it still shows in the model's next prediction. That response is LINEAR in the size of the kick -- measured on five checkpoints, the ratio is constant to within 0.2-4% across the amplitudes tested -- so one number per sigma describes your model: how strongly it lets a kick through. Asking for the level that holds the surviving kick under a residual budget gives eta(sigma) = (budget / that number)^2, clamped to 1. WHY THIS REPLACES THE ESCAPE RATHER THAN ADDING TO IT: it answers 'how much noise can this model absorb HERE', which is the question the escape's detector was approximating from a different quantity. It is not a policy and not a per-model table -- it is computed from the measurement taken on the model in front of you, so it travels to the next checkpoint by construction. MEASURED WHY IT MATTERS: on the same checkpoint the response number is about 1.35 at sigma 0.66 and 0.31 at sigma 0.28, so a 0.10 budget asks for eta 0.0055 early in a run and 0.072 late -- against a fixed eta of 1.0. The model tolerates far LESS noise early than the escape policy assumed. It applies to every eta_mode and REPLACES the level that mode would use; your 'eta' stays the CEILING, so a lower setting still gives a lower level. If the probe has no curve for this model the sampler falls back to the shipped behaviour silently. Both numbers are in the run log: 'eta_eff' (what was used) and 'eta_probe' (what was derived), plus '_eta_probe_gains' and '_eta_probe_sigmas' in the config."}),
+                    "tooltip": "Derives the noise level from the Autotuner's measurement of how much noise your model can absorb at each noise level, instead of the level the chosen mode would use. Off is the normal behaviour. On applies to every mode; your 'eta' still acts as a ceiling. If the Autotuner has no measurement for this model, the sampler uses the normal behaviour. The measurement is recorded automatically when this is on."}),
                 "eta_budget_from_probe": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Whether the residual budget used by 'eta_from_probe' comes from the PROBE rather than from the 'eta_probe_budget' widget. OFF is the delivered behaviour and the widget governs. ON uses the number the probe ALREADY measures on every probed run -- 'safe_fresh_frac', how big a kick this model still corrects, at the probe's own fixed 0.35 threshold. That is the same quantity and the same units as the budget widget, so switching this on replaces an invented default with a measurement. WHY IT EXISTS: the budget was the last hand-set number in an otherwise derived schedule, and it did not need to be -- the engine has been measuring exactly this quantity all along, for a different consumer. WHAT IT DOES NOT DO: it does not find a 'golden' setting. Measured across 20 curves, the response stays on its low-kick line all the way to the top of the amplitude ladder on 21 of 27 sigma samples, so there is no reachable knee to derive an optimum from; and the quantity itself says what the model CORRECTS, not what a viewer will accept. So this makes the number MEASURED rather than THE BEST -- if the images look under-noised, the widget is still there and you can set it yourself. If the probe has no usable value, this node silently falls back to 'eta_probe_budget'. Which source was used is stamped in the run config as '_eta_budget_src' ('widget' or 'probe'), and the measured value as '_eta_budget_measured'."}),
+                    "tooltip": "Only used when 'eta_from_probe' is on. Off: the budget comes from 'eta_probe_budget'. On: it comes from the Autotuner's own measurement of how large a kick your model still corrects. On replaces a fixed number with a measured one, but it does not find a best-looking setting; if the image looks under-noised, set the budget yourself."}),
                 "eta_probe_budget": ("FLOAT", {
                     "default": 0.10, "min": 0.01, "max": 1.0, "step": 0.01,
-                    "tooltip": "Only used when 'eta_from_probe' is ON: how much of an injected perturbation you are willing to let survive into the next prediction, as a fraction of an unperturbed reference. LOWER means less noise and a tighter schedule; HIGHER means more. The probe's own pass/fail threshold has always been 0.35, so the 0.10 default sits well inside what that experiment already treats as corrected. It is the one number that shapes the derived schedule, and it is deliberately a SAFE setting rather than an optimal one -- you cannot verify optimality on your own model, so the default is conservative and the sweep is yours to run."}),
+                    "tooltip": "Only used when 'eta_from_probe' is on and 'eta_budget_from_probe' is off. How much of a kick may still show in the model's next prediction, as a fraction of an undisturbed image. Lower means less noise and a tighter schedule; higher means more. This is the one number that shapes the derived noise level."}),
                 "escape_momentum_flatness": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Whether the momentum arm must ALSO see a flat image before it fires -- the test the original flatness detector always applied and this newer arm was missing. Leave it ON unless you specifically want the old ungated behaviour. WHY IT EXISTS, measured on a matched pair: a 16-bit pixel-art prompt run at eta 0.0 and eta 1.0 with the same seed, scheduler and step count produced a crisper image with a cleaner, more uniform pixel grid at eta 0.0, while eta 1.0 produced 'half/half pixels' -- cells the sampler could not resolve and mushed together. The cause is visible in the run log: every step the momentum arm fired had the image's fine detail at 1.4x to 3.3x the flatness threshold, i.e. the picture was FULL of structure the model was deliberately placing on a pixel grid. The arm fired anyway because it only tested whether the detail had stopped GROWING, and on pixel art a stopped-growing grid means the grid LOCKED, not that the trajectory gave up. With this ON, all three of those firings are suppressed and the run matches the deterministic arm that looked better; on the runs this arm was built for -- a genuine stall on a still-flat picture -- the check is inert. The per-step reading it tests is in every run log as 'eta_detail_abs', against the threshold stamped as 'eta_escape_detail'."}),
+                    "tooltip": "Only used when 'escape_mode' is 'momentum'. On: the momentum test also requires the image to be flat before it fires, the rule the original flatness test always had. Keep it on unless you deliberately want the older behaviour, which can fire on pixel art and other images whose fine detail has stopped growing but is not stalled."}),
                 "escape_growth_probe": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Whether the momentum arm's growth budget is DERIVED FROM THE PROBE rather than fixed. OFF is the shipped behaviour. ON makes the budget depend on how consistently the probe measured YOUR model's trajectory moving in one direction: a model whose trajectory keeps reversing (which is this sampler's own definition of being stuck -- every pixel moves, just back and forth) gets the budget opened up so the escape can fire, while a model that commits cleanly keeps the shipped budget and behaves exactly as it does today. WHY IT EXISTS, measured over 31 runs: the quantity that separates the runs where the escape fired from the runs where it did not is the probe's own direction-consistency curve, across its FULL range -- firing runs peak at -0.32 or below, silent runs at +0.60 or above. A fixed budget cannot express that, because the same model sampled in 16 steps builds more detail per step than in 50, so one number means different things at different step counts. Measured effect of switching it on: the 50-step checkpoint is untouched (51 armed steps either way) while the 16-step turbo checkpoints go from 0 to 18 and from 0 to 8. NOTE: this only does anything when 'escape_mode' is 'momentum'. The budget actually used is written to every run log as 'eta_growth_budget', and the measurement behind it as 'eta_escape_commit'."}),
+                    "tooltip": "Only used when 'escape_mode' is 'momentum'. Off: the momentum test uses a fixed allowance for detail growth. On: that allowance comes from the Autotuner's measurement of how consistently your model's trajectory moves in one direction; a model that keeps reversing gets a looser allowance, while a model that commits keeps the fixed one. Off is the normal behaviour."}),
             },
             # CHAINING, same convention as the other Options nodes: a node closest
             # to the Sampler wins where two of them set the same field.
             "optional": {
-                "options+": (OPT_TYPE, {"tooltip": "Connect another PD-AOS Options node here -- the Autotuner's 'options' output, the Noise (ETA) Options node, or the Debug Options node -- and its settings pass through, with this node's own overriding on any field both set."}),
+                "options+": (OPT_TYPE, {"tooltip": "Connect another PD-AOS Options node here (the Autotuner's options output, the Noise node or the Debug Options node). Its settings pass through, and this node overrides them where both set the same field. The node closest to the sampler wins."}),
             },
         }
 
@@ -752,20 +791,17 @@ class ResearchAFlopsExperimental:
 
 
 class ResearchPaperAEuler:
-    DESCRIPTION = ("A-FloPS A-Euler - the paper's Algorithm 2 (Jin et al., AAAI 2026, "
-                   "arXiv:2509.00036) applied DIRECTLY to a native flow model, with no "
-                   "extras. This is the faithful reference: it factorizes the FM velocity "
-                   "v = lambda*x + h with the adaptive lambda = <dv,dx>/||dx||^2 (Eq.12, "
-                   "UNCLAMPED -- neither Algorithm 2 nor the authors' reference clamps it, "
-                   "and this node passes no clamp), solves the linear drift exactly, and "
-                   "extrapolates the residual from the previous step (exponential "
-                   "integrator, first step Euler). One model call per step. The method is "
-                   "grid-agnostic: on a native flow model flow time is t = 1 - sigma, so "
-                   "each step's span IS the sigma difference and it runs on WHATEVER sigma "
-                   "list you feed it; connect it to a SamplerCustomAdvanced and drive it "
-                   "with any scheduler. For the paper's exact uniform-flow-time placement, "
-                   "use the companion 'A-FloPS A-Euler Schedule (paper)' node as the sigmas "
-                   "source.")
+    DESCRIPTION = ("A-FloPS A-Euler: the paper's Algorithm 2 (Jin et al., AAAI 2026, "
+                   "arXiv:2509.00036) applied directly to a native flow model, with no "
+                   "extra machinery. It splits the model's velocity into a straight-line "
+                   "part with an adaptive slope and a correction, solves the straight-line "
+                   "part exactly, then extrapolates the correction from the previous step; "
+                   "the first step is plain Euler. The adaptive slope is used unclamped: "
+                   "neither Algorithm 2 nor the authors' reference clamps it, and this node "
+                   "passes no clamp. One model call per step. It works with any sigma list, "
+                   "so connect it to SamplerCustomAdvanced and drive it with any scheduler; "
+                   "for the paper's exact uniform-flow-time placement, use the companion "
+                   "'A-FloPS A-Euler Schedule (paper)' node as the sigmas source.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
@@ -783,25 +819,23 @@ class ResearchPaperAEuler:
 
 
 class ResearchPaperAEulerSchedule:
-    DESCRIPTION = ("The paper's own schedule for A-FloPS A-Euler: sigmas placed at "
-                   "UNIFORM flow time t = n/N (noise -> clean), mapped through the model's "
-                   "own sigma<->time map: flow time is scaled to the NATIVE TIMESTEP by the "
-                   "model's own `multiplier` for the SD3/3.5, Wan and LTXV classes (and "
-                   "ModelSamplingAV), `flux_time_shift` for Flux, and `t/(1-t)` for "
-                   "Cosmos/RFlow. "
-                   "Connect this node's SIGMAS output to SamplerCustomAdvanced (or any "
-                   "sampler's sigmas input). This is the schedule Algorithm 2 assumes; the "
-                   "sampler itself also accepts any other scheduler's sigmas. Note: on "
-                   "cosmos-style sigma=t/(1-t) schedules the noise end is compressed, so "
-                   "the first step is very large - you may need more steps than 'simple' "
-                   "to match its quality.")
+    DESCRIPTION = ("The paper's own schedule for A-FloPS A-Euler: sigma values at uniform "
+                   "flow time, from noise to clean, mapped through the model's own time "
+                   "scaling. Flow time is converted to the model's native timestep using "
+                   "its multiplier for SD3/3.5, Wan and LTXV (and ModelSamplingAV), its "
+                   "time shift for Flux, and t/(1-t) for Cosmos/RFlow. Connect this node's "
+                   "'sigmas' output to SamplerCustomAdvanced or any sampler's sigmas input. "
+                   "This is the schedule Algorithm 2 assumes, but the sampler also accepts "
+                   "any other scheduler's sigmas. On Cosmos-style t/(1-t) schedules the "
+                   "noise end is compressed, so the first step is very large and you may "
+                   "need more steps than 'simple' to match its quality.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL", {"tooltip": "The model the run will use. Its own sigma<->time map defines the flow-time grid."}),
+                "model": ("MODEL", {"tooltip": "Connect the model the run will use. Its own noise-to-time mapping defines the flow-time grid this schedule is built on."}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000, "step": 1}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
@@ -830,54 +864,47 @@ class ResearchPaperAEulerSchedule:
 
 
 class ResearchAFlopsAutotuner:
-    DESCRIPTION = ("PD-AOS Autotuner: probes + schedule fine-tune in one node. "
-                   "Connect the guider the run will use and ANY scheduler's sigmas "
-                   "(e.g. BasicScheduler \"simple\"); the node measures the model and "
-                   "this prompt's trajectory at the schedule's noise levels (tiny "
-                   "probe latents), then re-allocates the steps of YOUR sigma list "
-                   "where the measured curvature needs them (error-equidistributed; "
-                   "flat curvature reproduces your list exactly). Outputs the "
-                   "fine-tuned sigmas for the sampler and the probe options for the "
-                   "PD-AOS Sampler node (connect its options output to the Sampler's "
-                   "options+ input). Two probes, two sizes: the MODEL probe is the "
-                   "bigger schedule-driving one and is cached per model+params+"
-                   "schedule (across prompts); the COND probe is the small per-prompt "
-                   "one, so its cost is what you feel each generation. Elementary "
-                   "knobs only: those two probe sizes, plus bias and warp, both "
-                   "1.0 = neutral (the probe's own error-optimal placement of your "
-                   "schedule). Both knobs use the factor 4**(w-1), so +0.5 and -0.5 "
-                   "are exact reciprocals of each other: equal power in either "
-                   "direction.")
+    DESCRIPTION = ("PD-AOS Autotuner: measures the model and this prompt with small test "
+                   "runs, then moves your scheduler's steps toward the parts of the run "
+                   "that measured as hardest. Connect the guider the run will use and any "
+                   "scheduler's sigmas; the tuned sigmas go to your sampler, and the "
+                   "'options' output goes to the PD-AOS Sampler's 'options+' input. The "
+                   "model measurement is reused for every prompt with the same model and "
+                   "settings; the prompt measurement runs on each generation. 'bias' and "
+                   "'warp' both start at 1.0, which is neutral: bias tilts where the "
+                   "measured placement puts steps, and warp moves the noise levels "
+                   "themselves. If the Autotuner cannot measure anything useful, your sigma "
+                   "list is passed through unchanged.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "guider": ("GUIDER", {"tooltip": "Connect the same guider your run uses, so the Autotuner measures the model and this prompt with the settings the run will actually use. It does its work here, before the sampler starts."}),
-                "sigmas": ("SIGMAS", {"tooltip": "Connect any scheduler's output (BasicScheduler \"simple\", Karras, and so on). This is the schedule the Autotuner fine-tunes. When it has no usable measurements the list is passed through unchanged, so your scheduler is always the fallback."}),
+                "guider": ("GUIDER", {"tooltip": "Connect the same guider your run uses, so the Autotuner measures the model and this prompt with the settings the run will actually apply. It does this before sampling starts."}),
+                "sigmas": ("SIGMAS", {"tooltip": "Connect any scheduler's output (for example BasicScheduler with 'simple' or Karras). This is the schedule the Autotuner fine-tunes. If it cannot measure anything usable, the list is passed through unchanged, so your scheduler is always the fallback."}),
                 "probe_steps": ("INT", {"default": 10, "min": 5, "max": 16, "step": 1,
-                    "tooltip": "How many steps the model probe uses, 5 at the minimum. This probe measures the model and decides the fine-tune of the schedule. Its result is kept and reused for every prompt with the same model and settings, so it costs you on the first run only."}),
+                    "tooltip": "How many steps the model probe uses, from 5 to 16. The model probe decides how the schedule is fine-tuned. Its result is reused for every prompt with the same model and settings, so it costs extra time only on the first run."}),
                 "probe_resolution": ("INT", {"default": 48, "min": 16, "max": 128, "step": 8,
-                    "tooltip": "The picture size the model probe runs at. 48 is the established value. Larger sizes are slower and measure more finely."}),
+                    "tooltip": "The image size the model probe runs at, from 16 to 128. Larger sizes measure more finely but are slower. 48 is the usual value."}),
                 "cond_probe_steps": ("INT", {"default": 4, "min": 3, "max": 8, "step": 1,
-                    "tooltip": "How many steps the prompt probe uses, 3 to 8. This probe runs again for every new prompt, so this is the setting you feel on each generation."}),
+                    "tooltip": "How many steps the prompt probe uses, from 3 to 8. This probe runs again for every new prompt, so this is the setting that affects each generation. Fewer steps are faster and measure less."}),
                 "cond_probe_resolution": ("INT", {"default": 16, "min": 8, "max": 32, "step": 8,
-                    "tooltip": "The picture size the prompt probe runs at. 16 is the default; 8 is the fastest and 32 the finest."}),
+                    "tooltip": "The image size the prompt probe runs at, from 8 to 32. 16 is the usual value; 8 is fastest and 32 measures most finely."}),
                 "bias": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "How the probes' placement is tilted, used only when 'probe_schedule' is on or this is off 1.00. 1.00 leaves the placement as measured. Below 1.00 puts more of the steps in the late, low-noise part of the run, where detail is built -- measured on the corpus, this moves steps down on every run tested. Above 1.00 concentrates the end of the run into a sharper final drop, so the last step lands at a higher noise level -- measured to do that on every run tested. The first and last steps are never moved. At the default nothing here does anything, because your scheduler places the steps."}),
+                    "tooltip": "Tilts where the steps are placed. 1.0 is neutral. Below 1.0 puts more steps in the late, low-noise part where detail forms; above 1.0 puts more in the early, high-noise part and leaves a larger final drop. The first and last steps never move. With 'probe_schedule' off, a value other than 1.0 still turns the measured placement on."}),
                 "warp": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Moves the sigma values themselves, leaving the first and last ones where they are. 1.00 keeps your schedule exactly as it is. Below 1.00 reaches low noise sooner and spends more of the run there. Above 1.00 does the opposite. Does nothing while auto_warp is on, and large values take the run outside the range of noise levels the probe measured."}),
+                    "tooltip": "Moves the noise levels themselves, keeping the first and last where they are. 1.0 keeps your schedule exactly. Below 1.0 reaches low noise sooner and spends more of the run there; above 1.0 does the opposite. Ignored when 'auto_warp' is on. Large values can take the run outside the range the Autotuner measured."}),
                 "auto_warp": ("BOOLEAN", {"default": False,
-                    "tooltip": "Chooses the warp for you. ON: the warp setting is ignored and the Autotuner uses the strongest value that keeps every step inside the range of noise levels it measured. OFF: your warp value is used exactly as you set it."}),
+                    "tooltip": "Chooses the warp for you. On: 'warp' is ignored and the Autotuner uses the strongest warp that keeps every step inside the range of noise levels it measured. Off: your 'warp' value is used as set."}),
                 # APPENDED LAST (rule 15).  ComfyUI stores a saved workflow's widget values as a
                 # POSITIONAL list, so a widget added anywhere but the END re-maps the values of the
                 # widgets after it -- silently, and onto plausible numbers.
                 "probe_smin_frac": ("FLOAT", {"default": 0.1, "min": 0.0001, "max": 0.1, "step": 0.0001,
-                    "tooltip": "How far down the noise range the two probes LOOK. 0.10 is what this node has always used: the probe stops at a tenth of the starting noise, so on a 16-step run it never measured below 0.17. Lower values measure deeper -- down to 0.0001, which reaches the model's own smallest noise level on the models tested -- and only then can the measurements say anything about where a run should end. This is a MEASUREMENT setting: at the default it changes nothing at all, and lowering it does not by itself move any steps. Cost: every step further down is extra model calls at the probe's own small size, on the model probe once per session and on the prompt probe every generation; going from 0.10 to 0.0001 multiplies the probe's model calls by roughly four. The count for each run is written into its log as the probe's step count."}),
+                    "tooltip": "How far down the noise range the probes measure, as a fraction of the starting noise. 0.10 stops at a tenth of the start; lower values measure closer to zero noise. This is a measurement setting: it does not move any steps by itself. Measuring deeper costs extra probe calls."}),
                 # APPENDED LAST (rule 15).
                 "probe_schedule": ("BOOLEAN", {"default": False,
-                    "tooltip": "Whether the steps are PLACED by what the probes measured. OFF (the default) is what this node has always done: your scheduler's list goes through unchanged, and the bias setting does nothing. ON: the probes' measured curvature decides where your steps go -- worth having where curvature is uneven, so the hard stretches get more steps and the easy ones get fewer -- and the bias setting tilts that placement towards structure or detail. This changes the sigma values themselves, so the images will differ from OFF; how much is written into the run's log."}),
+                    "tooltip": "On: the probes' measured curvature decides where your steps go, so hard stretches get more steps and easy stretches get fewer, and 'bias' tilts that placement. Off: your scheduler's list is passed through unchanged and 'bias' does nothing. On changes the noise levels themselves, so the image will differ from off."}),
                 # EXPERIMENTAL SWITCHES, HIDDEN IN THE RELEASE BUILD.  `pct_derived`
                 # and `wmax_budget` are no longer WIDGETS: they are fixed at their
                 # engine defaults (pct_derived = True, wmax_budget = 1.0), which is
@@ -1127,17 +1154,19 @@ class ResearchAFlopsAutotuner:
 
 
 class ResearchAFlopsErrorReport:
-    DESCRIPTION = ("Outputs the per-step internal decisions from the last run as JSON: "
-                   "solver chosen, errors, guard trips, anomaly verdicts, call counts, "
-                   "etc. Connect the sampled latent to 'trigger' to force this node to "
-                   "run after sampling. Only updates when the graph re-runs.")
+    DESCRIPTION = ("Shows what the sampler decided at every step of the last run, as JSON: "
+                   "the solver used, step errors, guard trips, anomaly detections and "
+                   "model-call counts. The sampler records up to 64 steps; for longer runs, "
+                   "turning on the Sampler's 'log_errors' keeps the latest 64 instead of "
+                   "the first 64. Connect the sampled latent to 'trigger' so this node runs "
+                   "after sampling finishes. It updates when the graph re-runs.")
     CATEGORY = "custom_sampling/research_samplers"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {},
-            "optional": {"trigger": ("LATENT", {"tooltip": "Connect the sampled latent here to force this node to run after sampling completes."})},
+            "optional": {"trigger": ("LATENT", {"tooltip": "Connect the sampled latent here so this node runs after sampling finishes and reports the current run."})},
         }
 
     RETURN_TYPES = ("STRING",)

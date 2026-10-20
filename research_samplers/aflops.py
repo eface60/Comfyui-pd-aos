@@ -1426,11 +1426,16 @@ def _schedule_sig(x, sigmas, cfg):
         except Exception:
             st = sigmas.detach().to("cpu", torch.float32).contiguous().flatten()
             h.update(str([round(float(v), 8) for v in st]).encode())
-        h.update(("ps=%d,pr=%d,pd=%d,wb=%d,sf=%.4f" % (
+        # `wb` (`wmax_bound`) IS DELIBERATELY ABSENT.  It reaches only the DERIVED
+        # calibration, and `_recalibrated` re-derives that from the profile's own
+        # measurements for the live cfg -- the same exemption `wmax_budget` has below.
+        # Carrying it here (and in `_node_probe_param_sig`) made the first
+        # `wmax_bound=True` run after each change miss the node-side profile and run a
+        # 10-step @ 64x64 pre-profile pass (~32 s on moss, 2026-10-20).
+        h.update(("ps=%d,pr=%d,pd=%d,sf=%.4f" % (
             int(cfg.get("probe_steps", 10)),
             int(cfg.get("probe_resolution", 48)),
             int(bool(cfg.get("pct_derived", False))),
-            int(bool(cfg.get("wmax_bound", False))),
             # `probe_smin_frac` CHANGES WHAT IS MEASURED -- it decides whether the grid stops at
             # 10% of sigma_max or reaches below it -- so it belongs in the key for exactly the
             # reason the comment above gives: a measurement cannot be re-derived from itself.  A
@@ -1447,8 +1452,9 @@ def _schedule_sig(x, sigmas, cfg):
         except (TypeError, ValueError):
             pass
         # The A/B experiment modes belong in this digest for the same reason
-        # `pct_derived` and `wmax_bound` do: they change the `trajectory_state`
-        # that gets CACHED INSIDE the profile.  Leaving them out made the
+        # `pct_derived` does: they change the `trajectory_state` that gets CACHED
+        # INSIDE the profile.  (`wmax_bound` is not in that class -- it changes only
+        # the DERIVED calibration, which `_recalibrated` re-derives.)  Leaving them out made the
         # oversmooth A/B unsound, and it is measured rather than theorised --
         # scratch_oversmooth_engine_mode_rig.py reads the corpus and finds 40 of
         # 380 runs at the shipped default that CONSUMED a non-zero `oversmooth`
@@ -1612,6 +1618,100 @@ def _graded_demand(ratio, rtol, lo, hi, r_hi, cap, graded):
     # clamp and the shipped behaviour is unchanged, but a deliberate `hi` ABOVE the flat value is honoured instead
     # of being silently swallowed.  `graded = False` still returns `cap` exactly, so the negative control holds.
     return float(min(max(round(lo + (hi - lo) * frac), 1.0), max(cap, hi)))
+
+
+def _order_floor_norm_curve(prof_c, prof_m, derived=False):
+    """THE A6 ARM'S CURVE: `(local_err_curve, sigma_curve, median)` from the finest profile that has one.
+
+    Precedence is per-prompt then model, the one every other curve consumer here uses
+    (`_recommend_dwell_from_profile`, `_build_step_curve`).  `median` is taken with the probe's OWN
+    estimator (`_probe_pct`, the same `pct_derived` toggle `med_local_err` is built with), so the
+    normaliser is the statistic the probe itself reports rather than a second convention invented
+    for the arm.
+
+    Returns `(None, None, None)` when no profile carries a usable curve; the caller then keeps the
+    shipped absolute test.
+    """
+    for prof in (prof_c, prof_m):
+        if not isinstance(prof, dict):
+            continue
+        curve = prof.get("local_err_curve") or []
+        sigc = prof.get("sigma_curve") or []
+        if not curve or len(sigc) < 2:
+            continue
+        try:
+            n = min(len(curve), len(sigc) - 1)
+            vals = [float(curve[i]) for i in range(n)]
+        except (TypeError, ValueError):
+            continue
+        if not vals:
+            continue
+        # The RAW `sigma_curve` is returned, not a pre-sliced copy: the `curve[i] <->
+        # sigma_curve[i+1]` anchor convention (`_prof_step_curve`) is applied in exactly ONE
+        # place, `_order_floor_norm_at`, so it cannot be applied twice by accident.
+        return vals, [float(v) for v in sigc], float(
+            _probe_pct(vals, 0.5, derived=derived))
+    return None, None, None
+
+
+def _order_floor_norm_at(curve, sigma_curve, s):
+    """The probe's local error at THIS step's sigma, by the curve's own anchor convention.
+
+    `curve[i]` sits at `sigma_curve[i+1]` (see `_prof_step_curve` and
+    `_build_curvature_schedule`) -- applied HERE, once, on the raw grid.  The nearest anchor is
+    taken in LOG sigma -- the frame every other curve consumer works in (`_curve_positions`, the
+    `_curv_at` lookup) -- and CLAMPED at both ends: a run step above the top anchor holds the
+    first value, one below the bottom holds the last (a tie resolves to the higher-sigma anchor,
+    the first in the descending grid).  Returns None when no anchor is usable.
+    """
+    if not curve or not sigma_curve:
+        return None
+    try:
+        ls = math.log(max(float(s), 1e-8))
+    except (TypeError, ValueError):
+        return None
+    n = min(len(curve), len(sigma_curve) - 1)
+    best_ls, best_v = None, None
+    for i in range(n):
+        try:
+            la = math.log(max(float(sigma_curve[i + 1]), 1e-8))
+            fv = float(curve[i])
+        except (TypeError, ValueError):
+            continue
+        if best_ls is None or abs(la - ls) < abs(best_ls - ls):
+            best_ls, best_v = la, fv
+    return best_v
+
+
+def _order_floor_norm_decision(prev_rtol, rtol, on, curve, sigma_curve, med, s):
+    """THE A6 GATE'S ONE OWNER -- returns, in ONE record, the gate and the value it compared.
+
+    `prev_rtol` is the CARRIED `err/tol` (None on the first step).  OFF (`on` False) is the
+    shipped absolute test, byte for byte.  ON compares the same ratio NORMALISED by the probe's
+    local error curve, `prev_rtol * median / local_err_k`, so a step locally STIFFER than the probe
+    measured closes the gate (the normalised value is smaller) and a CALMER step opens it.
+
+    The fallback is the shipped test whenever the normaliser is unusable -- no curve, no anchor,
+    or a non-positive divisor or median -- which is also what makes a CONSTANT curve reproduce the
+    shipped decision exactly (`local_err_k == median` -> the ratio is unchanged).
+
+    Returns `{"open", "ratio", "norm", "local_err", "used_norm"}`; `ratio` is what the graded ramp
+    must be fed (the normalised value when `used_norm`, else the raw carried ratio).
+    """
+    out = {"open": bool(prev_rtol is not None and prev_rtol > rtol),
+           "ratio": prev_rtol, "norm": None, "local_err": None, "used_norm": False}
+    if not on or prev_rtol is None or med is None or not (float(med) > 0.0):
+        return out
+    local_err = _order_floor_norm_at(curve, sigma_curve, s)
+    if local_err is None or not (local_err > 0.0):
+        return out
+    try:
+        norm = float(prev_rtol) * float(med) / float(local_err)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return out
+    out.update({"open": bool(norm > rtol), "ratio": norm, "norm": norm,
+                "local_err": float(local_err), "used_norm": True})
+    return out
 
 
 def _demand_policy(bound_available, q, by_bound, demand_bound, graded):
@@ -2299,13 +2399,99 @@ def _extrap_geom(us, u_t):
     return p / float(math.factorial(n))
 
 
-def _order_gate(pts, u_mid, order, wmax, limit, cfg, space="log_sigma"):
+def _dk_median(dk, order):
+    """The shipped per-order scalar from `cfg["_dk_scale"]`, int or str key, or None."""
+    try:
+        k = int(order)
+        if isinstance(dk, dict):
+            v = dk.get(k, dk.get(str(k)))
+            if v is not None:
+                return float(v)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _dk_step_at(cfg, order, sigma):
+    """`(series value, chosen index)` at THIS step's sigma, or `(None, None)`.
+
+    THE ARM.  `cfg["_dk_scale"]` is one median per order; `cfg["_dk_series"]` is the
+    per-step series that median was taken over.  When the caller asks (`dk_series_step`
+    ON) the gate uses the series entry whose anchor is nearest THIS step's sigma instead
+    of the median, so the remainder bound sees the LOCAL derivative scale rather than a
+    trajectory typical.
+
+    ANCHOR CONVENTION, the producer's own (see `_measure_dk_scale` and the profile stamp
+    beside `dk_scale`): the k-th difference is taken over `x0s[i-k..i]`, so it is anchored
+    at the END of its stencil and `dk_series[k][j]` belongs to `sigma_curve[k + j]`.  The
+    series entries therefore have DESCENDING anchors, exactly like `sigma_curve`.  The
+    entry whose interval contains a sigma is the one whose anchor is nearest in log-sigma
+    (the Voronoi cell of the anchors); outside the anchored span there is no enclosing
+    interval, so both ends CLAMP to the first / last entry -- the same clamp `curv_at`
+    applies in `_build_curvature_schedule` (`if s >= anchors[0][0] ... if s <=
+    anchors[-1][0]`).
+
+    FALLBACK IS THE MEDIAN (`(None, None)`), never a guess: no series, no `sigma_curve`,
+    no entry whose anchor exists in the curve, a non-finite/zero sigma, or a non-finite
+    series value all return `(None, None)` and the caller uses `_dk_median`.  Keys are
+    normalised because a JSON round-trip turns the order keys into strings.
+    """
+    try:
+        k = int(order)
+        s = float(sigma)
+        if not (s > 0.0) or not math.isfinite(s):
+            return None, None
+        ser = cfg.get("_dk_series")
+        sig = cfg.get("_sigma_curve")
+        if not isinstance(ser, dict) or not sig:
+            return None, None
+        vals = ser.get(k, ser.get(str(k)))
+        if not isinstance(vals, (list, tuple)) or not vals:
+            return None, None
+        curve = []
+        for v in sig:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                break
+            if not (v > 0.0) or not math.isfinite(v):
+                break
+            curve.append(v)
+        ls = math.log(s)
+        best = None
+        for j, v in enumerate(vals):
+            a = k + j
+            if a >= len(curve):
+                break
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not (fv > 0.0) or not math.isfinite(fv):
+                continue
+            d = abs(math.log(curve[a]) - ls)
+            if best is None or d < best[0]:
+                best = (d, fv, j)
+        if best is None:
+            return None, None
+        return best[1], best[2]
+    except Exception:
+        return None, None
+
+
+def _order_gate(pts, u_mid, order, wmax, limit, cfg, space="log_sigma", sigma=None):
     """(admitted, info) for one candidate order.  `info` is None on the shipped path.
 
     Shipped path (the arm OFF, or this order's scale unmeasured): the weight test alone,
     byte-identical to the code before this gate existed.  Arm ON: the weight test AND
     `(1 - exp(-du)) * geom * dk[k] <= rtol * wmax_budget`, where `du` is recovered from
     the midpoint every call site passes (`2*|u_mid - u_last|`).
+
+    THE STEP SIGMA.  `sigma` is the sigma the step STARTS from, passed EXPLICITLY by
+    every caller (rule 14: an explicit argument, not a module global) because the
+    `dk_series_step` arm anchors the per-order derivative scale on it (`_dk_step_at`).
+    With that arm OFF the argument is read by nothing, so the shipped path is unchanged;
+    with it ON and no usable series entry the gate falls back to the scalar median.
 
     THE GATE'S STATISTICS ARE LOG-SIGMA QUANTITIES, whatever space the nodes arrived
     in: `dk_scale` is measured per unit log-sigma (`_measure_dk_scale`), the scalar
@@ -2333,9 +2519,18 @@ def _order_gate(pts, u_mid, order, wmax, limit, cfg, space="log_sigma"):
         dk = cfg.get("_dk_scale")
         tol = cfg.get("rtol")
         k = int(order)
+        # THE SCALE THIS ORDER IS JUDGED ON.  `dk_series_step` ON replaces the trajectory
+        # median with the series entry anchored at THIS step's sigma; every fallback
+        # (arm OFF, no series, no usable entry) is the shipped `_dk_median` scalar.
         dscale = None
-        if isinstance(dk, dict):
-            dscale = dk.get(k, dk.get(str(k)))
+        dk_idx = None
+        dk_src = "median"
+        if bool(cfg.get("dk_series_step", False)):
+            dscale, dk_idx = _dk_step_at(cfg, k, sigma)
+            dk_src = "series" if dscale is not None else "median"
+            _ab_hit("dkstep.series" if dscale is not None else "dkstep.fallback")
+        if dscale is None:
+            dscale = _dk_median(dk, k)
         if dscale is None or tol is None:
             _ORDER_GATE_AB["unmeasured"] += 1
             return (float(wmax) <= float(limit)), None
@@ -2350,7 +2545,8 @@ def _order_gate(pts, u_mid, order, wmax, limit, cfg, space="log_sigma"):
         _ORDER_GATE_AB["on"] += 1
         _ORDER_GATE_AB["pass" if ok else "refuse"] += 1
         return bool(ok), {"k": k, "geom": geom, "du": du,
-                          "prop": prop, "dk": float(dscale), "bound": bound,
+                          "prop": prop, "dk": float(dscale),
+                          "dk_idx": dk_idx, "dk_src": dk_src, "bound": bound,
                           "step_err": step_err, "tol_eff": tol_eff,
                           "wmax": float(wmax), "limit": float(limit),
                           "bound_ok": bool(step_err <= tol_eff),
@@ -4765,12 +4961,32 @@ def _fuse_probe_state(prof_m, prof_c, sigmas, cfg):
         # the per-order derivative scale (`dk_scale`, model side preferred exactly as the scalar
         # path prefers it), the probe's own grid gap, and the real-grid gap the cap is consumed
         # on (`h_real`), so `_fuse_step_cap` calls `_derived_wmax_cap` the way the scalar
-        # derivation does instead of with invented arguments.
+        # derivation does instead of with invented arguments.  `h_step` (A8) is the same real
+        # grid's PER-STEP interval, built at the end of this function; `h_real` stays the run
+        # mean and remains the fallback wherever a step has no finite log gap.
         _dk = None
         for _p in (prof_m, prof_c):
             if isinstance(_p, dict) and isinstance(_p.get("dk_scale"), dict) and _p["dk_scale"]:
                 _dk = _p["dk_scale"]
                 break
+        # `probe_dk_per_side` (A3): each profile's OWN per-order derivative scale, carried
+        # SEPARATELY instead of the one shared `dk` above.  WHY: the bound `_derived_wmax_cap`
+        # builds is `_ck(k) * h^k * dk[k]` and the curvature is only a positivity gate, so one
+        # shared `dk` makes the two sides' caps equal BY CONSTRUCTION -- and that is what leaves
+        # `_fuse_step_cap`'s "the probes disagree, take the lower order" branch unreachable.
+        # A profile with no `dk_scale` supplies None (no substitution: the run-side `ord_bdk` is
+        # a different normalisation and must never be used here).
+        _dk_m = _dk_c = None
+        if bool(cfg.get("probe_dk_per_side", ENGINE_DEFAULTS.get("probe_dk_per_side", False))):
+            def _own_dk(_p):
+                _d = _p.get("dk_scale") if isinstance(_p, dict) else None
+                if not isinstance(_d, dict) or not _d:
+                    return None
+                try:
+                    return {int(_kk): float(_vv) for _kk, _vv in _d.items()}
+                except (TypeError, ValueError):
+                    return None
+            _dk_m, _dk_c = _own_dk(prof_m), _own_dk(prof_c)
         _lg = _hr = None
         for _p in (prof_m, prof_c):
             if not isinstance(_p, dict):
@@ -4779,11 +4995,34 @@ def _fuse_probe_state(prof_m, prof_c, sigmas, cfg):
                 _lg = _p.get("log_gap_probe")
             if _hr is None and _p.get("log_gap_real") is not None:
                 _hr = _p.get("log_gap_real")
+        # A8 `fuse_step_h`: THE RUN'S OWN PER-STEP INTERVAL, indexed exactly like `cm`/`cc`
+        # (0-based; step k spans `sigmas[k] -> sigmas[k+1]`, which is the k the step loop
+        # passes).  `h_i = log(s_i / s_{i+1})`.  The terminal interval (`s_{i+1} <= 1e-8`) has
+        # no finite log gap, so its entry is None and the cap falls back to the run mean
+        # `h_real` -- the value OFF uses at EVERY step, so a fallback cannot move a step that
+        # OFF would not move.  Built HERE because this is the only place the run's `sigmas`
+        # meet the fusion state.  Consumed ONLY by `_fuse_step_cap`, and only when the arm is
+        # ON, so the OFF path never reads it (the arm changes what is DERIVED, not what the
+        # probe MEASURES -- no probe cache key).
+        _h_step = None
+        try:
+            _sv = [float(v) for v in sigmas]
+            if len(_sv) >= 2:
+                _h_step = []
+                for _j in range(len(_sv) - 1):
+                    try:
+                        _a, _b = _sv[_j], _sv[_j + 1]
+                        _h_step.append(math.log(_a / _b) if _b > 1e-8 else None)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        _h_step.append(None)
+        except (TypeError, ValueError):
+            _h_step = None
         return {
             "w0": float(w0), "w": float(w0), "n": len(pos), "k": 0,
             "cm": cm, "cc": cc, "sides": sides,
             "loss": [0.0, 0.0], "n_ev": [0, 0], "unevaluated": 0,
-            "dk": _dk, "log_gap": _lg, "h_real": _hr,
+            "dk": _dk, "dk_m": _dk_m, "dk_c": _dk_c,
+            "log_gap": _lg, "h_real": _hr, "h_step": _h_step,
         }
     except Exception:
         return None
@@ -4821,6 +5060,22 @@ def _fuse_step_cap(st, k, cfg, rtol, flags, cap_now=None, allow_raise=False):
     decision rather than on the raw number, so the threshold is respected instead of averaged.
     Returns None when no cap is available, in which case the caller keeps today's value.
 
+    ONE SHARED `dk_scale` IS WHAT MAKES THE TWO CAPS EQUAL BY CONSTRUCTION, and the branch above
+    unreachable (`rig_wmax_cap.py` V3 measures cap(0.5) == cap(40) to 1e-12): the bound is
+    `_ck(k) * h^k * dk[k]` and the curvature is only a positivity gate.  `probe_dk_per_side`
+    (A3) replaces that with each profile's own `dk_scale` for its own side -- see the scale
+    selection below.  `c_f`'s derivation is deliberately UNCHANGED: it keeps the shipped shared
+    `dk_scale`, so the arm moves only the two side caps the branch compares.
+
+    THE `h` IN THAT BOUND IS THE STEP'S OWN INTERVAL under `fuse_step_h` (A8): the shipped form
+    evaluates every step and every order at the run-MEAN log gap (`h_real` = `log_gap_real`), so
+    a schedule whose tail steps are longer than its head is judged at a spacing it does not have
+    -- `h^k` under-states the tail (measured on a simple/karras grid: a tail step's du is 2-5x
+    the mean, i.e. 4x-625x at k = 2..5) and over-states the head.  A8 passes the step's own
+    `h_i = log(s_i/s_{i+1})` instead, and the run mean remains the fallback wherever `h_i` does
+    not exist (terminal interval, one-step run) -- so a log-uniform grid, where `h_i == h_mean`,
+    is decision-identical to OFF by construction.
+
     `cap_now` IS THE CAP THE RUN WOULD USE WITHOUT THIS ARM, and `allow_raise` decides whether the
     fused cap may exceed it.  With `allow_raise=False` (the shipped default, and its own switch)
     the fused cap can only LOWER the step's cap, so switching the fusion on is a strict refinement
@@ -4844,8 +5099,25 @@ def _fuse_step_cap(st, k, cfg, rtol, flags, cap_now=None, allow_raise=False):
             c_f = (1.0 - w) * cm[k] + w * cc[k]
             c_m, c_c = cm[k], cc[k]
         _dk = st.get("dk")
-        _h = float(st.get("h_real") or 0.0) or None
-        _bud = float(flags.get("wmax_budget", 1.0) or 1.0)
+        # `probe_dk_per_side` (A3): WHICH SCALE EACH SIDE'S CAP IS DERIVED WITH.  Off: the one
+        # shared `dk` for both, exactly as shipped.  On: `c_m` from the model profile's own
+        # `dk_scale`, `c_c` from the cond profile's, and the two orders are compared only over
+        # the k BOTH sides measured.  WHY THE COMMON SET: `_derived_wmax_cap` certifies the
+        # highest k whose bound fits, so with unequal key sets the two caps would be
+        # certification levels taken on different stencils (the cond probe's grid is shorter:
+        # 4 steps certify k<=3, 8 steps k<=5).  A side with no `dk_scale`, or no k in common,
+        # falls back to the SHIPPED shared value, so missing evidence cannot move the cap.
+        _per_side = bool(cfg.get("probe_dk_per_side",
+                                 ENGINE_DEFAULTS.get("probe_dk_per_side", False)))
+        _dk_m = _dk_c = _dk
+        if _per_side:
+            _m, _c = st.get("dk_m"), st.get("dk_c")
+            if _m and _c:
+                _common = set(_m) & set(_c)
+                if _common:
+                    _dk_m = {_kk: float(_vv) for _kk, _vv in _m.items() if _kk in _common}
+                    _dk_c = {_kk: float(_vv) for _kk, _vv in _c.items() if _kk in _common}
+            st["dk_m_used"], st["dk_c_used"] = _dk_m, _dk_c
         # WHICH DERIVATION?  THE SAME ONE THE SCALAR PATH USES.  This is the fix for the krea
         # collapse: the arm called `_derived_wmax_cap` UNCONDITIONALLY, while the scalar path only
         # uses that derivation when the profile's `wmax_bound` flag enables it -- so on a
@@ -4854,6 +5126,37 @@ def _fuse_step_cap(st, k, cfg, rtol, flags, cap_now=None, allow_raise=False):
         # force 1.50 against a pre-arm 5.22 (order 2 instead of 5), while anima's cap moved
         # 5.38 -> 3.28 -- both of which admit order 5, which is why anima looked unaffected.
         _bound_on = bool(flags.get("wmax_bound"))
+        # A8 `fuse_step_h`: WHICH `h` THE BOUND IS EVALUATED AT.  OFF (shipped): the run-mean
+        # log gap `h_real` at every step and every order.  ON: THIS step's own
+        # `h_i = log(s_i / s_{i+1})`, from `st["h_step"]` (built by `_fuse_probe_state` from the
+        # run's own sigmas).  A step with no usable per-step gap -- the terminal interval, a
+        # one-step run, or a zero-length interval, which `_derived_wmax_cap` treats as degenerate
+        # -- falls back to the run mean, i.e. the OFF value, and the log records that (`mean`).
+        # The gap only enters the bound, so the arm changes what is DERIVED from the probe's
+        # measurements, not what the probe measures; no probe cache key.
+        _h = float(st.get("h_real") or 0.0) or None
+        _h_src = "probe" if _h is None else "mean"
+        if bool(cfg.get("fuse_step_h", ENGINE_DEFAULTS.get("fuse_step_h", False))):
+            _hs = st.get("h_step")
+            _hi = None
+            try:
+                if _hs is not None and 0 <= int(k) < len(_hs):
+                    _v = _hs[int(k)]
+                    if _v is not None and float(_v) > 0.0:
+                        _hi = float(_v)
+            except (TypeError, ValueError):
+                _hi = None
+            if _hi is not None:
+                _h, _h_src = _hi, "step"
+            else:
+                _ab_hit("fuse.h_step_fallback")
+            # Written from the state the cap just consumed, exactly like the per-side scales
+            # below, so the log field is the value the maths used.  None when the derived bound
+            # is off: the shipped-cap path never reads an `h`, and claiming one would be a
+            # number nothing consumed.
+            st["h_step_used"] = (_h if (_bound_on and _h is not None) else None)
+            st["h_step_src"] = _h_src if st["h_step_used"] is not None else "probe"
+        _bud = float(flags.get("wmax_budget", 1.0) or 1.0)
         st["derivation"] = "derived" if _bound_on else "shipped"
         cap_f = None
         if _bound_on:
@@ -4864,20 +5167,29 @@ def _fuse_step_cap(st, k, cfg, rtol, flags, cap_now=None, allow_raise=False):
         if cap_f is None and _bound_on and c_m is not None and c_c is not None:
             return None
         caps = []
+        _side_cap = {}
         if _bound_on:
-            for c_i in (c_m, c_c):
+            for _tag, c_i, dk_i in (("m", c_m, _dk_m), ("c", c_c, _dk_c)):
                 if c_i is None:
                     continue
-                _c, _i = _derived_wmax_cap(c_i, st.get("log_gap"), rtol, dk=_dk,
+                _c, _i = _derived_wmax_cap(c_i, st.get("log_gap"), rtol, dk=dk_i,
                                            h_real=_h, budget=_bud)
                 if _c is not None:
                     caps.append(float(_c))
+                    _side_cap[_tag] = float(_c)
+        if _per_side:
+            st["cap_m"], st["cap_c"] = _side_cap.get("m"), _side_cap.get("c")
         out = None
         if len(caps) == 2:
             o_a = _max_order_for_cap(caps[0])
             o_b = _max_order_for_cap(caps[1])
             if o_a is not None and o_b is not None and o_a != o_b:
                 out = min(caps)               # conservative: the LOWER order cap
+                # REACHABILITY COUNTER for the rule this arm exists to make reachable (rule 14).
+                # It cannot fire with the shared scale -- equal caps imply equal orders -- so an
+                # OFF run's records are untouched by this line.
+                _ab_hit("fuse.cap_per_side_disagrees",
+                        round(float(max(caps) / max(min(caps), 1e-9)), 6))
         if out is None:
             out = float(cap_f) if cap_f is not None else (min(caps) if caps else None)
         # THE ARM MAY TIGHTEN, NEVER DEMOTE -- and the reference is the cap the run would ACTUALLY
@@ -5260,6 +5572,47 @@ def _compute_consistency(derivative_norm, x0_norm, step_size):
     # code *multiplied* by step_size, which drove the term to 0 (consistency
     # -> 1, i.e. "always stable") on flow models with tiny log-sigma steps.
     return 1.0 / (1.0 + float(derivative_norm) / (float(x0_norm) * step))
+
+def _second_order_jump_mask(ord_px, jmap, dtype):
+    """The per-pixel mask for the second-order slope term, with the JUMP axis (finding 09).
+
+    Returns `(mask, q50)`.  `mask` (float, `dtype`) is what `_aflops_step(order_mask=...)`
+    multiplies the slope term by; `q50` is the per-step median of `jmap` that formed it, or
+    None when `jmap` is None and the shipped mask is returned unchanged.
+
+    WHY THIS EXISTS.  The shipped mask gives the slope term to every pixel whose ADMITTED
+    order is >= 2.  Finding 09 (`findings/2026-10-19-per-step-audit/09-second-order-mask.md`)
+    reports that on the audited corpus that set is small and jump-POSITIVE -- the term lands
+    on pixels that are moving sharply -- so this arm adds one condition: the pixel must ALSO
+    be in the low half of this step's per-pixel jump map, `jmap <= median(jmap)`.  THE
+    PREMISE IS THE FINDING'S, NOT THIS RIG'S: the synthetic connectivity rig measures what
+    the arm DOES (the mask narrows, and by how much), not the corpus fraction.
+
+    NOTHING ELSE MOVES.  The `second_order_per_pixel` gate and the slope term itself are
+    untouched; this decides only which pixels receive the term.
+
+    SHAPES ARE ALIGNED THEN CHECKED, NOT BROADCAST.  A 4-D latent (image) gives
+    `jmap` `[B,H,W]` or `[B,1,H,W]`; a 5-D latent (video/tiled -- e.g. TiledDiffusion's
+    frame axis) gives `jmap` `[B,T,H,W]` and an order map `[B,1,T,H,W]`.  Singleton axes
+    are inserted AFTER the batch dim until the ranks match, so the mask lands on the same
+    `(B, C, T, H, W)` axes as the order map.  A genuine mismatch (different H/W, or a
+    batch/channel that is not 1) still RAISES with both shapes in the message, because a
+    silent broadcast against the channel or batch axis is exactly how a per-pixel mask
+    turns into a whole-image one without a single failing line.
+    """
+    _ord = (ord_px.float() >= 2.0)
+    if jmap is None:
+        return _ord.to(dtype), None
+    _jm = jmap.detach().float()
+    while _jm.dim() < _ord.dim():
+        _jm = _jm.unsqueeze(1)
+    if tuple(_jm.shape) != tuple(_ord.shape):
+        raise RuntimeError(
+            "second_order_jump_mask: jmap shape %s does not match the order map shape "
+            "%s; refusing to broadcast a mask" % (tuple(_jm.shape), tuple(_ord.shape)))
+    _q50 = float(torch.quantile(_jm.reshape(-1), 0.5))
+    return (_ord & (_jm <= _q50)).to(dtype), _q50
+
 
 def _aflops_step(x, x0, hist, s, sn, order=2, lam_min=None, lam_max=None,
                  series_switch=None, order_mask=None, raw_slope=False):
@@ -7330,9 +7683,10 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
             # to certify, and the cap then falls back rather than guessing.
             "dk_scale": _measure_dk_scale(x0s, gap_probe, return_series=True)[0],
             # THE PER-STEP SERIES behind that median.  The scalar above is what the cap
-            # consumes today; this is what a per-model order_max equation needs, because
-            # a median hides the tail where the probe and the run disagree.  Anchor:
-            # series[k][i] belongs to sigma_curve[k + i].
+            # consumes; this is what the `dk_series_step` order gate reads, because a
+            # median hides the tail where the probe and the run disagree.  Anchor:
+            # series[k][i] belongs to sigma_curve[k + i], and `_dk_step_at` consumes it
+            # with exactly that convention.
             "dk_series": _measure_dk_scale(x0s, gap_probe, return_series=True)[1],
             # THE A/B FLAGS THIS PROFILE WAS BUILT UNDER.  `_calib_flags` reads this, and
             # without it the `wmax_bound` arm was INERT whatever the widget said -- a toggle
@@ -7473,6 +7827,30 @@ def _apply_probe_profile(cfg, profile, tune, auto_tunable=None):
         _dk = profile.get("dk_scale")
         if isinstance(_dk, dict) and _dk:
             cfg["_dk_scale"] = {int(k): float(v) for k, v in _dk.items()}
+            # THE PER-STEP SERIES AND THE SIGMA AXIS IT IS ANCHORED ON, adopted with the
+            # median they belong to and ONLY from the same profile: the `dk_series_step`
+            # arm reads a series entry by its anchor `sigma_curve[k+j]`, so a series
+            # paired with another profile's curve would be anchored on the wrong grid.
+            # Both are set even when absent (None) so a run can never consume a previous
+            # profile's series beside this profile's median.
+            _ser = profile.get("dk_series")
+            _ns = None
+            if isinstance(_ser, dict) and _ser:
+                try:
+                    _ns = {int(k): [float(x) for x in v]
+                           for k, v in _ser.items()
+                           if isinstance(v, (list, tuple)) and v}
+                except (TypeError, ValueError):
+                    _ns = None
+            cfg["_dk_series"] = _ns or None
+            _sig = profile.get("sigma_curve")
+            _ps = None
+            if isinstance(_sig, (list, tuple)) and _sig:
+                try:
+                    _ps = [float(x) for x in _sig]
+                except (TypeError, ValueError):
+                    _ps = None
+            cfg["_sigma_curve"] = _ps or None
     except Exception as _e:
         logging.debug("[PD-AOS] dk_scale not applied: %s", _e)
     if auto_tunable is None:
@@ -7497,6 +7875,36 @@ def _apply_probe_profile(cfg, profile, tune, auto_tunable=None):
         _set("guard_floor", calib["guard_floor"])
     if tune.get("tol", True) and "rtol" in calib:
         _set("rtol", calib["rtol"])
+    # THE `tol_from_curve` INPUTS (ENGINE_DEFAULTS, OFF = shipped).
+    #
+    # The step loop cannot see a profile: it runs inside the engine, which only holds `cfg`.  The
+    # curve and the two gap measurements that scale it are therefore copied here, at the one site
+    # that already turns this profile into cfg values (it is also where `calib["rtol"]`, the value
+    # this arm replaces in the two gates, is applied).  COPIED ONLY WHEN THE ARM IS ON: an extra
+    # cfg key on every run would change an OFF run's `cfg` dump, and OFF must be identical to the
+    # A1 base, cfg dump included.
+    #
+    # `gap_r`/`gap_p` are `log_gap_real`/`log_gap_probe` -- the SAME pair `_derive_calibrations`
+    # divides for `calib["rtol"]`'s grid scale -- so the curve is corrected for the probe-vs-run
+    # grid mismatch by that derivation's own rule, not by a second one invented here.
+    #
+    # NO PROBE CACHE KEY: this changes what is DERIVED from the profile, never what the probe
+    # MEASURES.  `probe_tune_tol` is deliberately NOT read: it governs the probe's run-level rtol,
+    # while this arm has its own switch, which is the only thing that decides whether it runs.
+    if bool(cfg.get("tol_from_curve", False)):
+        try:
+            _lec = [float(v) for v in (profile.get("local_err_curve") or [])]
+            if _lec:
+                cfg["_tol_curve"] = {
+                    "local_err_curve": _lec,
+                    "sigma_curve": [float(v) for v in (profile.get("sigma_curve") or [])],
+                    "gap_r": float(profile.get("log_gap_real") or 0.0),
+                    "gap_p": float(profile.get("log_gap_probe") or 0.0),
+                }
+        except (TypeError, ValueError):
+            # A curve that cannot be read is simply not supplied; the per-step record then says
+            # `tol_step_src = "run"`, so the fallback is visible rather than silent.
+            pass
     if tune.get("wmax", True) and "wmax_base" in calib:
         _set("wmax_base", calib["wmax_base"])
     if tune.get("anomaly", True):
@@ -8167,13 +8575,16 @@ def _node_probe_param_sig(cfg):
     """Fingerprint of the probe parameters that are baked into a model
     profile's measurement (widget changes must invalidate the cache).
 
-    THE CALIB FLAGS BELONG HERE.  They change what the profile MEASURES -- which
-    percentile estimator is used, and which wmax cap is derived -- so a profile built
-    under one setting must not be reused after the switch is flipped.  They were missing,
-    which produced exactly the symptom the operator reported twice: flipping the switch
-    changed nothing, because `_PROBE_PROFILES.get(pkey)` hit the cached profile and the
-    engine trusts an exact-key hit as-is.  The stale profile even carried the OLD
-    `calib_flags` in its own log, which is how the reuse was visible.
+    `pct_derived` BELONGS HERE; `wmax_bound` DOES NOT.  `pct_derived` changes the
+    percentile ESTIMATOR, so it changes what the profile's measurements ARE: a profile
+    built with the other estimator must not be reused.  `wmax_bound` reaches only the
+    DERIVED calibration (`calib["wmax_bound"]`), and `_calib_inputs` / `_recalibrated`
+    re-derive that from the profile's own measurements for the live cfg before any
+    consumer reads it.  Keying it here bought nothing and cost a full probe: measured on
+    moss (2026-10-20), the node-side model profile was keyed `wb=False`, the sampler's cfg
+    was `wb=True`, the exact key missed, and the sampler ran a 10-step @ 64x64
+    pre-profile pass (~32 s) before every generation that followed a `wmax_bound` change.
+    `wmax_budget` is excluded for the same re-derivation reason.
 
     THE A/B MODES BELONG HERE FOR THE SAME REASON, and were missed when the calib
     flags were fixed.  They change `trajectory_state`, which is cached INSIDE the
@@ -8206,7 +8617,10 @@ def _node_probe_param_sig(cfg):
         "e" if bool(cfg.get("probe_endgame", True)) else "-",
         "c" if bool(cfg.get("probe_dir_cons", True)) else "-",
         "pd" if bool(cfg.get("pct_derived", False)) else "-",
-        "wb" if bool(cfg.get("wmax_bound", False)) else "-",
+        # `wmax_bound` is deliberately ABSENT: `_calib_inputs` / `_recalibrated` re-derive
+        # `calib["wmax_bound"]` from the profile's own measurements, so keying it only
+        # fragmented the cache and forced a 10-step probe on the first `wmax_bound=True`
+        # run after each change (the operator's 2026-10-20 delay).
         "osm=" + str(cfg.get("_osm_ab_mode", "engine") or "engine"),
         "ev=" + str(cfg.get("_ev_ab_mode", "engine") or "engine"),
         # `probe_smin_frac` changes the probe GRID, so it must invalidate the
@@ -9913,9 +10327,10 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             # to certify, and the cap then falls back rather than guessing.
             "dk_scale": _measure_dk_scale(x0s, gap_probe, return_series=True)[0],
             # THE PER-STEP SERIES behind that median.  The scalar above is what the cap
-            # consumes today; this is what a per-model order_max equation needs, because
-            # a median hides the tail where the probe and the run disagree.  Anchor:
-            # series[k][i] belongs to sigma_curve[k + i].
+            # consumes; this is what the `dk_series_step` order gate reads, because a
+            # median hides the tail where the probe and the run disagree.  Anchor:
+            # series[k][i] belongs to sigma_curve[k + i], and `_dk_step_at` consumes it
+            # with exactly that convention.
             "dk_series": _measure_dk_scale(x0s, gap_probe, return_series=True)[1],
             # THE A/B FLAGS THIS PROFILE WAS BUILT UNDER.  `_calib_flags` reads this, and
             # without it the `wmax_bound` arm was INERT whatever the widget said -- a toggle
@@ -9980,6 +10395,17 @@ def _apply_cond_probe_profile(cfg, cond_profile, tune, weight, auto_tunable):
             _dk = cond_profile.get("dk_scale")
             if isinstance(_dk, dict) and _dk:
                 cfg["_dk_scale"] = {int(k): float(v) for k, v in _dk.items()}
+                # The series and its sigma axis travel WITH the median they were measured
+                # from (see `_apply_probe_profile`): a cond series anchored on the model
+                # probe's grid, or the reverse, is a scale read at the wrong sigma.
+                _ser = cond_profile.get("dk_series")
+                if isinstance(_ser, dict) and _ser:
+                    cfg["_dk_series"] = {int(k): [float(x) for x in v]
+                                         for k, v in _ser.items()
+                                         if isinstance(v, (list, tuple)) and v}
+                _sig = cond_profile.get("sigma_curve")
+                if isinstance(_sig, (list, tuple)) and _sig:
+                    cfg["_sigma_curve"] = [float(x) for x in _sig]
         except Exception:
             pass
     w = max(0.0, min(float(weight), 1.0))
@@ -11179,6 +11605,23 @@ ENGINE_DEFAULTS = {
     "order_reset_on_anomaly": True,
     "probe_is_distilled": "auto",
     "cond_probe_is_distilled": "auto",
+    # ---------------------------------------------------------------------------------------
+    # THE 2026-10-19 PER-STEP AUDIT'S A/B ARMS.  Eight independent switches, every one
+    # APPENDED LAST and every one OFF/zero by default, so a graph that never touches them
+    # runs exactly as this build did.  Each is an EXPERIMENT, not a shipped setting: put one
+    # in a copy of the same prompt, seed and schedule and compare the two images.  Every arm
+    # writes the value it put in force to that run's own log, so the two runs are attributed
+    # from their records rather than from a filename.  Findings:
+    # findings/2026-10-19-per-step-audit/.  The Debug Options node exposes all eight at the
+    # end of its widget list; the engine also reads them from an API graph or a chained node.
+    "tol_step_du": False,
+    "hist_cos_quantile": 0.0,
+    "probe_dk_per_side": False,
+    "dk_series_step": False,
+    "second_order_jump_mask": False,
+    "order_floor_norm": False,
+    "tol_from_curve": False,
+    "fuse_step_h": False,
 }
 def _progress(callback, ptype, phase, i=0, n=1, msg="", extra=None):
     if callback is None:
@@ -12122,6 +12565,22 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                              ENGINE_DEFAULTS.get("order_floor_adaptive_r_hi", 0.3031)))
     _order_floor_rtol = float(cfg.get("order_floor_adaptive_rtol",
                                       ENGINE_DEFAULTS.get("order_floor_adaptive_rtol", 0.05)))
+    # ---- THE A6 ARM: NORMALISE THE GATE'S CARRIED RATIO BY THE PROBE'S LOCAL ERROR CURVE -----
+    # OFF (shipped) compares `_prev_rtol` to the fixed `_order_floor_rtol`.  ON compares
+    # `_prev_rtol * med_local_err / local_err_k` to the SAME threshold, in the same normalised
+    # units, and feeds the graded ramp the normalised value.
+    # `_of_norm_r_hi` is the ramp's top IN THE NORMALISED UNITS (0.12).  It is a LOCAL constant,
+    # deliberately NOT a read of `order_floor_adaptive_r_hi`: that widget is expressed in the
+    # shipped absolute units, so reinterpreting a value set there as a normalised one would move
+    # the meaning of a shipped default.  Nothing here writes `cfg`, so the shipped value cannot
+    # move on either arm.  Read once per run when the arm is ON; OFF never enters this block.
+    _of_norm_on = bool(cfg.get("order_floor_norm",
+                               ENGINE_DEFAULTS.get("order_floor_norm", False)))
+    _of_norm_r_hi = 0.12
+    _of_norm_curve, _of_norm_sig, _of_norm_med = (None, None, None)
+    if _of_norm_on:
+        _of_norm_curve, _of_norm_sig, _of_norm_med = _order_floor_norm_curve(
+            lf_prof_c, lf_prof_m, bool(cfg.get("pct_derived", False)))
     # `order_demand_q > 0` selects the BOUND-DERIVED request for the automatic mode (see ENGINE_DEFAULTS).
     _order_demand_q = float(cfg.get("order_demand_q",
                                     ENGINE_DEFAULTS.get("order_demand_q", 0.0)) or 0.0)
@@ -12435,6 +12894,14 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
     s_min_n = float(pos[-1]) if len(pos) > 0 else 1e-8
     calls = 0
     tol = max(float(cfg.get("rtol", 0.05)), 1e-3)
+    # PER-STEP INTERVAL, for the 2026-10-19 audit arms (`tol_step_du`, `tol_from_curve`).
+    # `du_i = log(s_i / s_{i+1})` is the step's own interval; the terminal interval
+    # (`s_next <= 1e-8`) is excluded because its ratio is not a finite interval, and the
+    # run's reference is the median of what remains.  None when no interval is usable (a
+    # one-step run), and the consuming arms then leave the run-level tolerance untouched.
+    _du_run = [math.log(float(sigmas[j]) / float(sigmas[j + 1]))
+               for j in range(len(sigmas) - 1) if float(sigmas[j + 1]) > 1e-8]
+    _du_ref = (float(statistics.median(_du_run)) if _du_run else None)
     # ---------------------------------------------------------------------------------------
     # THE TOLERANCE-FLOOR A/B.  `use_measured_tolerance` (ENGINE_DEFAULTS, OFF = shipped)
     # chooses between the two things that can govern `tol`: the tolerance measured for THIS
@@ -12816,6 +13283,150 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
         s = float(sigmas[i])
         sn = float(sigmas[i + 1])
         k = i + 1
+        # PER-STEP INTERVAL AND THE AUDIT-ARM LOG CARRIER.  `_AUDIT_AB_STEP` is emptied at
+        # the top of every step so nothing carries from the previous one; each audit arm
+        # writes the value it put in force here, and the step record merges it once.  The
+        # arms therefore never edit the shared per-step log literal, which keeps them
+        # independent in the source as well as in the maths.
+        _du_step = (math.log(s / sn) if sn > 1e-8 else None)
+        _AUDIT_AB_STEP = {}
+        # THE `dk_series_step` ARM'S PER-STEP RECORD.  Written on EVERY ON step, not only
+        # on steps whose ladder reaches the gate, so the reader can see WHICH series entry
+        # this step's sigma anchors -- including the clamped ends -- rather than inferring
+        # it from the steps the gate happened to run on.  `dk_step_idx` is None where the
+        # arm fell back to the median, so the fallback is visible instead of being a value
+        # that happens to equal the median.  `/h` and `/geom` are not duplicated here: the
+        # gate's own step record already carries `space`, `wgeom`, `wtol`, `wbound`,
+        # `wgate_k` and the step's `sigma`/`sigma_next`, which is everything the V0
+        # recomputation needs (the engine can run the gate in log-sigma OR sigma space,
+        # and the midpoint differs between them, so `space` is part of the record).
+        if bool(cfg.get("dk_series_step", False)):
+            _dk_step_v = {}
+            _dk_step_i = {}
+            _dk_scale_cfg = cfg.get("_dk_scale")
+            for _kk in (2, 3):
+                _dv, _dj = _dk_step_at(cfg, _kk, s)
+                _dused = _dv if _dv is not None else _dk_median(_dk_scale_cfg, _kk)
+                if _dused is not None:
+                    _dk_step_v[str(_kk)] = float(_dused)
+                    _dk_step_i[str(_kk)] = (None if _dv is None else int(_dj))
+            _AUDIT_AB_STEP["dk_step"] = _dk_step_v
+            _AUDIT_AB_STEP["dk_step_idx"] = _dk_step_i
+        # THE PER-STEP TOLERANCE A/B -- TWO arms, each OFF by default.
+        #
+        # WHAT THEY SELECT.  Both gates below (the corrector blend at `corr.blend_fired` and
+        # the Euler-safety cut at `cut.fired`) compare ONE run-level tolerance against
+        # per-step deviations.  `_tol_step` is the value they compare; `tol` itself is NEVER
+        # reassigned -- `tol` is already in force here (the cfg/default value, the derived
+        # floor and the probe blend have all been applied above, before the loop), so
+        # `_prev_rtol` (`err / tol`), the `_order_gate` call on `cfg['rtol']` and every other
+        # consumer of `tol` keep their definition in every arm.
+        #
+        #   `tol_step_du`    (A1, OFF) scales `tol` by the step's own interval relative to the
+        #                    run's median interval, clamped to [0.25, 4.0]: a step wider than
+        #                    the run's median gets proportionally more room, a narrower one
+        #                    proportionally less.
+        #   `tol_from_curve` (A7, OFF) replaces that with the probe's own local-error curve:
+        #                        tol_step = clamp(3 * local_err_curve[j] * gapscale, 0.005, 0.04)
+        #                        gapscale = clamp((gap_r / gap_p) ** 2, 0.04, 1.0)
+        #                    with `gapscale = 1.0` when either gap measurement is absent.
+        #
+        # PRECEDENCE.  When BOTH are ON the curve wins: it is a per-step MEASUREMENT, while the
+        # du arm is a rescaling of the run-level tolerance, and applying both would put two
+        # scalings on one gate.  `tol_step_src` names the source of the value in force
+        # ("curve" / "du" / "run").
+        #
+        # THE FLOOR (`_DERIVED_RTOL`, from the `derived_ab` arm) WAS APPLIED ABOVE, to `tol`,
+        # before the loop, and is NOT re-applied to the curve's value: the rule's own
+        # clamp(..., 0.005, 0.04) IS that value, and the 1.536e-2 minimum was measured on the
+        # run-level tolerance, not on this per-step predictor.
+        #
+        # WHY NO PROBE CACHE KEY: both arms change what is DERIVED from the profile's
+        # tolerance, never what the probe MEASURES, so no profile depends on them and these
+        # reads happen again on every step.
+        #
+        # The per-step record is written ONLY when an arm is ON: a switch that adds a log field
+        # when it is OFF has already changed the thing an A/B holds fixed, and OFF must be
+        # bit-identical to the base record (same rule as the fusion arm's fields above).
+        _tol_step = tol
+        _tol_src = "run"
+        _tol_lec = None
+        _curve_on = bool(cfg.get("tol_from_curve", False))
+        if _curve_on:
+            # REACHABILITY (rule 9): the site counts every arrival, and `tol.curve.applied`
+            # counts the steps that used a curve value, so "the switch is connected" is a
+            # counter in `aflops_cfg.ab_reach` rather than an assumption.
+            _ab_hit("tol.curve.site")
+            _tc = cfg.get("_tol_curve")
+            if _tc:
+                _lec = _tc.get("local_err_curve") or []
+                _sc = _tc.get("sigma_curve") or []
+                _gp = float(_tc.get("gap_p") or 0.0)
+                _gr = float(_tc.get("gap_r") or 0.0)
+                # THE GRID SCALE, the same expression `_derive_calibrations` applies to
+                # `med_local_err` (`clamp((gap_r/gap_p)**2, 0.04, 1)`), so the curve is
+                # corrected for the probe-vs-run grid mismatch by that derivation's own rule.
+                _gapscale = (min(max((_gr / _gp) ** 2, 0.04), 1.0)
+                             if (_gp > 1e-9 and _gr > 1e-9) else 1.0)
+                # ALIGNMENT, copied from the probe's own curves rather than invented.  Curve
+                # sample k is the value at `sigma_curve[k+1]` (the producer's documented
+                # convention, consumed by `_prof_step_curve` and `_build_curvature_schedule`),
+                # and the same index shift puts run step `i` at `sigmas[i+1]` -- the position
+                # `_real_step_positions` uses.  NEAREST anchor in log-sigma; because the search
+                # spans every sample, a position outside the anchors holds the end sample, and
+                # that IS the clamp at both ends.  The terminal interval (`sigmas[i+1] == 0`)
+                # therefore holds the last sample rather than a value fabricated from log(0);
+                # ties go to the larger-sigma sample.
+                if len(_lec) >= 2 and len(_sc) >= len(_lec) + 1:
+                    _pos = math.log(max(float(sn), 1e-8))
+                    _best, _bd = 0, None
+                    for _k in range(len(_lec)):
+                        _d = abs(_pos - math.log(max(float(_sc[_k + 1]), 1e-8)))
+                        if _bd is None or _d < _bd:
+                            _best, _bd = _k, _d
+                    _tol_lec = float(_lec[_best])
+            # THE FALLBACK IS COUNTED TOO, and OUTSIDE the `if _tc` above: an absent carrier and
+            # a carrier too short to align are the same state to this arm, and counting only the
+            # present-but-short case left the absent case with a site count and no outcome -- a
+            # toggle that looks connected while nothing says it did not act.
+            if _tol_lec is not None:
+                _tol_step = min(0.04, max(0.005, 3.0 * _tol_lec * _gapscale))
+                _tol_src = "curve"
+                _ab_hit("tol.curve.applied")
+            else:
+                _ab_hit("tol.curve.no_curve")
+        _du_on = bool(cfg.get("tol_step_du", False))
+        if _tol_src != "curve" and _du_on:
+            if _du_step is not None and _du_ref is not None:
+                _tol_step = tol * min(max(_du_step / _du_ref, 0.25), 4.0)
+                _tol_src = "du"
+            _AUDIT_AB_STEP["tol_step"] = round(float(_tol_step), 9)
+            _AUDIT_AB_STEP["tol_du"] = (None if _du_step is None
+                                        else round(float(_du_step), 9))
+        # THE A6 ARM'S DECISION, TAKEN ONCE AND HERE.  This is the only point in the step where BOTH
+        # of the gate's inputs are already in force: `_prev_rtol` is carried from the last MEASURED
+        # step, and `s` is THIS step's sigma.  The demand site and the per-step stamp below read this
+        # record instead of recomputing, so the gate the maths runs and the gate the log reports
+        # cannot disagree (the `_graded_demand` one-owner pattern).  OFF leaves `_of_dec` None and
+        # every shipped expression runs untouched.
+        _of_dec = None
+        if _of_norm_on and _order_floor_auto:
+            _of_dec = _order_floor_norm_decision(_prev_rtol, _order_floor_rtol, True,
+                                                 _of_norm_curve, _of_norm_sig,
+                                                 _of_norm_med, s)
+            _AUDIT_AB_STEP["ord_floor_norm"] = (
+                None if _of_dec["norm"] is None else round(float(_of_dec["norm"]), 6))
+            _AUDIT_AB_STEP["ord_floor_local_err"] = (
+                None if _of_dec["local_err"] is None
+                else round(float(_of_dec["local_err"]), 9))
+        if _curve_on:
+            # `tol_step` is written here as well as in the du block above, so that the du
+            # arm's own record (its fields AND their order) stays byte-identical to A1's when
+            # this arm is OFF: with the curve OFF this block does not run at all.
+            _AUDIT_AB_STEP["tol_step"] = round(float(_tol_step), 9)
+            _AUDIT_AB_STEP["tol_step_local_err"] = (None if _tol_lec is None
+                                                    else round(float(_tol_lec), 9))
+            _AUDIT_AB_STEP["tol_step_src"] = _tol_src
         # THE x0 ESTIMATOR THIS STEP FED TO THE INTEGRATOR, recorded with the step so
         # that the NEXT step's `v_prev`/`h_prev` come from the same estimator (C4).
         # None when the integrator did not run this step, and then the next step falls
@@ -13132,19 +13743,71 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
             hist_cos_val = float(((_hd1 * _hd2).sum() / (_hn1 * _hn2))
                                  .clamp(-1.0, 1.0))
             _thr = float(cfg.get("history_consistency_threshold", 0.0))
-            if _hist_cos_px_on:
+            # AUDIT ARM `hist_cos_quantile` (A2).  A hard `-_thr` sign test gates EVERY
+            # pixel whose cosine is negative, so the gated fraction is whatever the model's
+            # step happens to produce rather than a quantity the run asks for.  q == 0 (the
+            # default) is the shipped path byte for byte and computes nothing extra.  q > 0
+            # replaces the fixed cut with THIS STEP's own quantile of the per-pixel cosines,
+            # so the gate releases the (1-q) fraction of pixels whose cosine is least
+            # reversing, whatever this step's absolute cosine level is.  BOTH branches read
+            # the ONE `_tau` below, so the whole-image gate can never sit on a different
+            # threshold from the per-pixel one.  The value in force is stamped into the step
+            # record as `hist_cos_tau` (only when q > 0, so the OFF record keeps its field
+            # set), and the gated fraction is still `hist_cos_px_neg` /
+            # `histcos.px.order_gated`.
+            #
+            # SCOPE: only the `-_thr` sign test moves.  The whole-image arm's second rule
+            # (`elif hist_cos_val < _thr`, the positive band that takes `eff_cap` to 2) keeps
+            # reading `_thr` in both arms, because it is a different decision; it is also
+            # unreachable at the shipped `_thr = 0`, where its test `hist_cos_val < _thr` is
+            # the `if`'s own test -- so the `elif` runs only when the `if` was false, i.e.
+            # never.
+            _hq = float(cfg.get("hist_cos_quantile", 0.0) or 0.0)
+            _hq_on = bool(_hq > 0.0)
+            _cos_px = None
+            _tau = None
+            if _hist_cos_px_on or _hq_on:
                 # LOCAL cosines over channels.  The mask is applied to the admitted order
                 # map below, after the ladder has built it.  The global `eff_cap` is NOT
                 # cut here: a local reversal should gate that pixel, not the whole image.
+                # Built on the whole-image arm too when `_hq_on`, because that branch has to
+                # cut on the same per-pixel quantile -- so `_cos_px` is never None while
+                # `_tau` is in force.
                 _pn1 = _hd1.pow(2).sum(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
                 _pn2 = _hd2.pow(2).sum(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
                 _cos_px = ((_hd1 * _hd2).sum(dim=1, keepdim=True)
                            / (_pn1 * _pn2)).clamp(-1.0, 1.0)
-                hist_cos_px_neg = (_cos_px < -_thr)
+            if _hq_on:
+                # THE PER-STEP QUANTILE.  Pooled over every element of `_cos_px`, i.e. the
+                # finding's rule: one quantile of THIS step's pixels.  `_cos_px` carries a
+                # batch axis when the latent is batched, and pooling over it is the SAME
+                # convention `hist_cos_val` itself uses (a whole-tensor scalar), which is
+                # what lets both branches cut on one `_tau`.  At the shipped batch of 1 the
+                # pooled quantile IS the per-image one, so the choice is inert there.
+                # `interpolation="linear"` is named because the number is audited against
+                # this rig's own reconstruction.
+                _tau = float(torch.quantile(_cos_px.reshape(-1), _hq,
+                                            interpolation="linear"))
+                _AUDIT_AB_STEP["hist_cos_tau"] = round(_tau, 6)
+            if _hist_cos_px_on:
+                if _hq_on:
+                    # q = 1 must gate EVERY pixel (the finding's control), and a strict `<`
+                    # against the maximum leaves the maximum pixel(s) ungated.  `<=` at
+                    # q >= 1 is the exact cut, with no epsilon to choose; below q = 1 the
+                    # strict `<` is kept.
+                    hist_cos_px_neg = ((_cos_px <= _tau) if _hq >= 1.0
+                                       else (_cos_px < _tau))
+                else:
+                    hist_cos_px_neg = (_cos_px < -_thr)
                 _ab_hit("histcos.px.applied",
                         float(hist_cos_px_neg.float().mean()))
             else:
-                if hist_cos_val < -_thr:
+                if _hq_on:
+                    _px_cut = ((hist_cos_val <= _tau) if _hq >= 1.0
+                               else (hist_cos_val < _tau))
+                else:
+                    _px_cut = (hist_cos_val < -_thr)
+                if _px_cut:
                     eff_cap = 1
                 elif (hist_cos_val < _thr and eff_cap > 2
                       and not (adaptive_on
@@ -13287,6 +13950,36 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
             else:
                 _ab_hit("fuse.cap_unavailable")
             _cap_in_force = float(wmax_limit)
+            # A3 `probe_dk_per_side`: the scales and the two caps the branch above compared,
+            # written from the state `_fuse_step_cap` just filled -- so each number is the one
+            # the decision consumed, never a recomputation from the config.  NINE decimals on
+            # the caps: the decision is `_uniform_halfstep_wmax(o) <= cap`, so the log must be
+            # able to reproduce the comparison (rule 8).  Only on the arm: with it OFF this
+            # block writes nothing and the record is the shipped one.
+            if bool(cfg.get("probe_dk_per_side",
+                            ENGINE_DEFAULTS.get("probe_dk_per_side", False))):
+                _AUDIT_AB_STEP["dk_m"] = _fuse_st.get("dk_m_used")
+                _AUDIT_AB_STEP["dk_c"] = _fuse_st.get("dk_c_used")
+                _cm = _fuse_st.get("cap_m")
+                _cc = _fuse_st.get("cap_c")
+                _AUDIT_AB_STEP["wmax_cap_m"] = (None if _cm is None
+                                                else round(float(_cm), 9))
+                _AUDIT_AB_STEP["wmax_cap_c"] = (None if _cc is None
+                                                else round(float(_cc), 9))
+            # A8 `fuse_step_h`: THE `h` THE FUSED CAP CONSUMED this step, from the state
+            # `_fuse_step_cap` just filled (never a recomputation from the config).  Written
+            # only when the fusion actually produced a cap AND the derived bound ran, because
+            # the shipped-cap path never reads an `h` and stamping one there would claim a
+            # consumer that does not exist.  `h_real_step_src` says whether the step's own gap
+            # (`step`) or the run mean (`mean`) was used -- the fallback is a fact the reader
+            # must not have to infer; `probe` never reaches an entry (h_step_used is None then).
+            if (bool(cfg.get("fuse_step_h",
+                             ENGINE_DEFAULTS.get("fuse_step_h", False)))
+                    and _fc is not None
+                    and _fuse_st.get("h_step_used") is not None):
+                _AUDIT_AB_STEP["h_real_step"] = round(
+                    float(_fuse_st.get("h_step_used")), 9)
+                _AUDIT_AB_STEP["h_real_step_src"] = _fuse_st.get("h_step_src")
         eff = 1
         wmax = 0.0
         x0m = x0
@@ -13331,7 +14024,7 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                     c_log = _mid_x0(pts_log, 0.5 * (u_log + u2_log), ce)
                     _ok_ce, _gi_ce = _order_gate(
                         pts_log, 0.5 * (u_log + u2_log), ce, c_log[1],
-                        (_lim2 if ce == 2 else wmax_limit), cfg)
+                        (_lim2 if ce == 2 else wmax_limit), cfg, sigma=s)
                     if not _ok_ce:
                         continue
                     if k >= 2:
@@ -13359,7 +14052,7 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                     _ok_ce, _gi_ce = _order_gate(
                         pts, 0.5 * (u_i + u_n), ce, cand[1],
                         (_lim2 if ce == 2 else wmax_limit), cfg,
-                        space=use_space)
+                        space=use_space, sigma=s)
                     if _ok_ce:
                         x0m, wmax, eff = cand[0], cand[1], ce
                         _wgate_info = _gi_ce
@@ -13440,7 +14133,7 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                 wlevs.append(wv)
                 _ok_ce, _gi_ce = _order_gate(pts_w, u_mid_w, ce, wv,
                                              (_lim2 if ce == 2 else wmax_limit), cfg,
-                                             space=use_space)
+                                             space=use_space, sigma=s)
                 allowed.append(_ok_ce)
                 winfo.append(_gi_ce)
             _max_ord = eff_cap
@@ -13616,14 +14309,27 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                 else:
                     _gate_open = bool(_prev_rtol is not None
                                       and _prev_rtol > _order_floor_rtol)
+                    # A6 `order_floor_norm`: the ON arm reads the step's single decision record
+                    # (`_of_dec`), which carries the normalised value when the curve supplied one
+                    # and the shipped absolute test otherwise.  OFF executes the shipped
+                    # expression above and feeds the ramp the raw ratio, exactly as before.
+                    _of_ratio = _prev_rtol
+                    _of_r_hi_use = _of_r_hi
+                    if _of_dec is not None:
+                        _gate_open = _of_dec["open"]
+                        _of_ratio = _of_dec["ratio"]
+                        _of_r_hi_use = (_of_norm_r_hi if _of_dec["used_norm"]
+                                        else _of_r_hi)
                     # ONE OWNER (`_graded_demand`), called identically by the stamp below.
-                    _fl_val = _graded_demand(_prev_rtol, _order_floor_rtol, _of_lo, _of_hi,
-                                             _of_r_hi, _order_floor_demand, _of_graded)
+                    _fl_val = _graded_demand(_of_ratio, _order_floor_rtol, _of_lo, _of_hi,
+                                             _of_r_hi_use, _order_floor_demand, _of_graded)
                     # REACHABILITY (rule 9): the site counts its own invocations, so a batch can prove the
-                    # gate RAN rather than infer it from an effect.
+                    # gate RAN rather than infer it from an effect.  The value beside the counter is the
+                    # one the gate COMPARED (`_of_ratio`: the normalised value on the ON arm), not the
+                    # raw carried ratio -- on the OFF arm the two are the same object.
                     _ab_hit("order.floor_adaptive.open" if _gate_open
                             else "order.floor_adaptive.shut",
-                            None if _prev_rtol is None else round(float(_prev_rtol), 6))
+                            None if _of_ratio is None else round(float(_of_ratio), 6))
             if _fl_val > 1.0:
                 try:
                     _fl = torch.full_like(o_new, min(float(_fl_val),
@@ -13819,7 +14525,7 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
             _c_o2 = _mid_x0(_bpts, _bmid, 2)
             _ok_o2, _gi_o2 = _order_gate(_bpts, _bmid, 2, _c_o2[1],
                                          max(wmax_limit, wmax_mid_floor), cfg,
-                                         space=use_space)
+                                         space=use_space, sigma=s)
             if _ok_o2:
                 _wgate_info = _gi_o2
                 _x0m_o2 = _c_o2[0]
@@ -13960,7 +14666,25 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                 # term globally overrides that protection (D/B: the term is net harmful in
                 # the volatile half and is not the detail carrier).  None is the shipped
                 # global term, byte-identical.
-                _so_mask = (ord_px.float() >= 2.0).to(x.dtype)
+                if bool(cfg.get("second_order_jump_mask", False)):
+                    # THE JUMP AXIS (finding 09).  Keep the shipped order test and ALSO
+                    # require the pixel to be in the low half of THIS step's per-pixel jump
+                    # map, so the term is confined to pixels that are not moving sharply.
+                    # The mask and its median are formed by one owner, which is also what
+                    # checks the shapes instead of letting a broadcast pick the axis.
+                    _so_mask, _so_q50 = _second_order_jump_mask(ord_px, jmap, x.dtype)
+                    # The value this arm put in force, beside the fraction it produced: the
+                    # comparison `jmap <= q50` is only reproducible with the median logged.
+                    _AUDIT_AB_STEP["second_order_jmap_q"] = (
+                        None if _so_q50 is None else round(float(_so_q50), 9))
+                    # REACHABILITY (rule 9): the fallback and the formed mask are counted
+                    # separately, so "ON but no jump map" cannot read as "ON and it shrank".
+                    if _so_q50 is None:
+                        _ab_hit("secondorder.jump_mask.no_jmap")
+                    else:
+                        _ab_hit("secondorder.jump_mask", round(float(_so_q50), 9))
+                else:
+                    _so_mask = (ord_px.float() >= 2.0).to(x.dtype)
                 _ab_hit("secondorder.px.mask", float(_so_mask.mean()))
             _so_raw = bool(cfg.get("second_order_raw_lambda", False))
             if _so_raw:
@@ -13988,9 +14712,11 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                 # error, so this is zero extra model calls).
                 # A/B #3a: the archive-known-good corrector took the corrected
                 # step UNCONDITIONALLY (archive line 6868: `x = aflops_out`).
-                if (corrector_ab and err is not None and err > tol):
+                # THE THRESHOLD IS `_tol_step`: the run-level `tol` itself on the OFF arm, and
+                # that value rescaled by this step's interval only when `tol_step_du` is ON.
+                if (corrector_ab and err is not None and err > _tol_step):
                     _ab_hit("corr.blend_fired", round(float(err), 8))
-                    _w = max(tol / max(err, 1e-12), 0.0)
+                    _w = max(_tol_step / max(err, 1e-12), 0.0)
                     x = x_pred + _w * (aflops_out - x_pred)
                     # T2c INSTRUMENTATION.  The weight actually used here, under a
                     # name that cannot be confused with the PIXEL-blend weight that
@@ -14094,7 +14820,9 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
                                              strength=grad_strength)
                 except Exception:
                     _e_pred_used = None
-                if _e_raw is not None and _e_raw > tol:
+                # THE THRESHOLD IS `_tol_step`: the run-level `tol` itself on the OFF arm, and
+                # that value rescaled by this step's interval only when `tol_step_du` is ON.
+                if _e_raw is not None and _e_raw > _tol_step:
                     _ab_hit("cut.fired", round(float(_e_raw), 8))
                     # CAPTURED BEFORE THE REPLACEMENT: this is the per-pixel error that
                     # triggered the cut, and the only honest reading of the step.
@@ -14389,6 +15117,10 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
         # what the clamp analysis currently has to approximate.  RMS (not norm)
         # so the numbers do not scale with latent size.
         _raw = {}
+        # THE AUDIT ARMS' PER-STEP RECORD.  Each arm wrote the value it put in force into
+        # `_AUDIT_AB_STEP` at its own site; this is the one place they enter the log, so a
+        # reader sees the value the maths used, not a reconstruction from the config.
+        _raw.update(_AUDIT_AB_STEP)
         try:
             _xi = x_input.float()
             _x0f = x0.float()
@@ -14531,11 +15263,21 @@ def _aflops_engine_body(model, x, sigmas, extra_args=None, callback=None,
             # record cannot disagree with the maths even on a step where the ladder never ran.  The fixed
             # modes stamp EXACTLY what they stamped before: this branch is new, that one is untouched.
             _gate_rec = bool(_prev_rtol is not None and _prev_rtol > _order_floor_rtol)
-            # THE GRADED RAMP'S VALUE, on every arm -- it is a pure function of the carried error ratio,
-            # so on the "bound" and "bound_map" arms it does NOT report the demand that ran (audit
-            # U04/U25 `aflops.py:13449`, still open).  `ord_demand` below is the value in force.
-            _raw["ord_floor"] = _graded_demand(_prev_rtol, _order_floor_rtol, _of_lo, _of_hi,
-                                               _of_r_hi, _order_floor_demand, _of_graded)
+            # A6 `order_floor_norm`: the same single record the demand site read, so `ord_floor_gate`
+            # and `ord_floor` are the ON arm's values on every step -- including a step where the
+            # ladder never ran, because the decision is taken at the top of the step.  OFF keeps
+            # the shipped pair of expressions byte for byte.
+            _of_ratio_rec = _prev_rtol
+            _of_r_hi_rec = _of_r_hi
+            if _of_dec is not None:
+                _gate_rec = _of_dec["open"]
+                _of_ratio_rec = _of_dec["ratio"]
+                _of_r_hi_rec = (_of_norm_r_hi if _of_dec["used_norm"] else _of_r_hi)
+            # THE GRADED RAMP'S VALUE, on every arm -- it is a pure function of the carried error
+            # ratio, so on the "bound" and "bound_map" arms it does NOT report the demand that ran
+            # (audit U04/U25 `aflops.py:13449`, still open).  `ord_demand` below is the value in force.
+            _raw["ord_floor"] = _graded_demand(_of_ratio_rec, _order_floor_rtol, _of_lo, _of_hi,
+                                               _of_r_hi_rec, _order_floor_demand, _of_graded)
             _raw["ord_floor_px"] = _ord_floor_n
             # THE DEMAND LEVEL ACTUALLY PUT IN FORCE THIS STEP (1.0 = nothing raised), on every arm, so
             # the request can be audited instead of inferred from a pixel count.
